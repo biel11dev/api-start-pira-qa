@@ -2116,82 +2116,187 @@ app.delete("/api/employee-weekly-meta/:id", async (req, res) => {
   }
 });
 
-// POST - Migrar dados históricos retroativos (executar uma única vez)
+// POST - Migrar dados criando metas semanais específicas para todas as semanas com pontos
 app.post("/api/migrate-employee-meta-history", async (req, res) => {
   try {
-    // Buscar todos os funcionários com dados salariais
+    console.log("Iniciando migração de metas semanais...");
+    
+    // Buscar todos os funcionários
     const employees = await prisma.employee.findMany({
       where: {
-        OR: [
-          { valorHora: { not: null } },
-          { metaHoras: { not: null } },
-          { bonificacao: { not: null } }
-        ]
+        ativo: true
       }
     });
 
+    console.log(`Encontrados ${employees.length} funcionários ativos`);
+
     if (employees.length === 0) {
       return res.json({ 
-        message: "Nenhum funcionário com dados salariais encontrado",
-        migrated: 0 
+        message: "Nenhum funcionário encontrado",
+        totalEmployees: 0,
+        totalWeeks: 0,
+        created: 0,
+        skipped: 0
       });
     }
 
-    let migrated = 0;
-    let skipped = 0;
+    let totalWeeksCreated = 0;
+    let totalWeeksSkipped = 0;
     const results = [];
 
+    // Função auxiliar para calcular início e fim da semana (terça a domingo)
+    const getWeekRange = (date) => {
+      const currentDate = new Date(date);
+      const dayOfWeek = currentDate.getDay();
+      
+      let tuesday = new Date(currentDate);
+      if (dayOfWeek === 0) { // Domingo
+        tuesday.setDate(tuesday.getDate() - 5);
+      } else if (dayOfWeek === 1) { // Segunda
+        tuesday.setDate(tuesday.getDate() - 6);
+      } else if (dayOfWeek >= 2) { // Terça a sábado
+        tuesday.setDate(tuesday.getDate() - (dayOfWeek - 2));
+      }
+      tuesday.setHours(0, 0, 0, 0);
+      
+      const sunday = new Date(tuesday);
+      sunday.setDate(sunday.getDate() + 5);
+      sunday.setHours(23, 59, 59, 999);
+      
+      return { weekStart: tuesday, weekEnd: sunday };
+    };
+
     for (const employee of employees) {
-      // Verificar se já existe histórico para este funcionário
-      const existingHistory = await prisma.employeeMetaHistory.findFirst({
-        where: { employeeId: employee.id }
+      console.log(`Processando funcionário: ${employee.name} (ID: ${employee.id})`);
+      
+      // Buscar todos os pontos do funcionário
+      const points = await prisma.dailyPoint.findMany({
+        where: { 
+          employeeId: employee.id,
+          date: { not: null }
+        },
+        orderBy: { date: 'asc' }
       });
 
-      if (existingHistory) {
-        skipped++;
+      console.log(`  - ${points.length} pontos encontrados`);
+
+      if (points.length === 0) {
         results.push({
           employeeId: employee.id,
           name: employee.name,
-          status: "skipped",
-          reason: "Já possui histórico"
+          status: "no-points",
+          weeksCreated: 0,
+          weeksSkipped: 0,
+          message: "Sem pontos registrados"
         });
         continue;
       }
 
-      // Criar registro histórico inicial
-      await prisma.employeeMetaHistory.create({
-        data: {
-          employeeId: employee.id,
-          valorHora: employee.valorHora || 0,
-          metaHoras: employee.metaHoras || 0,
-          bonificacao: employee.bonificacao || 0,
-          validFrom: employee.dataEntrada || employee.createdAt || new Date(2024, 0, 1),
-          validUntil: null // Meta atual
+      // Agrupar pontos por semana
+      const weeklyGroups = new Map();
+      
+      points.forEach(point => {
+        const pointDate = new Date(point.date);
+        const dayOfWeek = pointDate.getDay();
+        
+        // Ignorar segundas-feiras
+        if (dayOfWeek === 1) return;
+        
+        const { weekStart, weekEnd } = getWeekRange(pointDate);
+        const weekKey = weekStart.toISOString().split('T')[0];
+        
+        if (!weeklyGroups.has(weekKey)) {
+          weeklyGroups.set(weekKey, {
+            weekStart,
+            weekEnd,
+            year: weekStart.getFullYear(),
+            month: weekStart.getMonth() + 1
+          });
         }
       });
 
-      migrated++;
+      console.log(`  - ${weeklyGroups.size} semanas únicas identificadas`);
+
+      let weeksCreated = 0;
+      let weeksSkipped = 0;
+
+      // Criar meta para cada semana
+      for (const [weekKey, weekData] of weeklyGroups) {
+        try {
+          // Verificar se já existe meta para esta semana
+          const existing = await prisma.employeeWeeklyMeta.findUnique({
+            where: {
+              employeeId_weekStart: {
+                employeeId: employee.id,
+                weekStart: weekData.weekStart
+              }
+            }
+          });
+
+          if (existing) {
+            console.log(`  - Semana ${weekKey} já possui meta (pulando)`);
+            weeksSkipped++;
+            continue;
+          }
+
+          // Criar meta semanal com valores do funcionário
+          const created = await prisma.employeeWeeklyMeta.create({
+            data: {
+              employeeId: employee.id,
+              weekStart: weekData.weekStart,
+              weekEnd: weekData.weekEnd,
+              year: weekData.year,
+              month: weekData.month,
+              metaHoras: employee.metaHoras || 0,
+              bonificacao: employee.bonificacao || 0,
+              valorHora: employee.valorHora || 0
+            }
+          });
+
+          console.log(`  - ✅ Semana ${weekKey} criada (ID: ${created.id})`);
+          weeksCreated++;
+          totalWeeksCreated++;
+        } catch (error) {
+          console.error(`  - ❌ Erro ao criar meta para semana ${weekKey}:`, error.message);
+          weeksSkipped++;
+        }
+      }
+
+      totalWeeksSkipped += weeksSkipped;
+
+      console.log(`  - Resultado: ${weeksCreated} criadas, ${weeksSkipped} puladas`);
+
       results.push({
         employeeId: employee.id,
         name: employee.name,
-        status: "migrated",
+        status: weeksCreated > 0 ? "migrated" : "skipped",
+        weeksCreated,
+        weeksSkipped,
+        totalWeeks: weeklyGroups.size,
         valorHora: employee.valorHora,
         metaHoras: employee.metaHoras,
         bonificacao: employee.bonificacao
       });
     }
 
+    console.log(`\n=== RESUMO DA MIGRAÇÃO ===`);
+    console.log(`Total de funcionários: ${employees.length}`);
+    console.log(`Total de semanas criadas: ${totalWeeksCreated}`);
+    console.log(`Total de semanas puladas: ${totalWeeksSkipped}`);
+    console.log(`Total de semanas: ${totalWeeksCreated + totalWeeksSkipped}`);
+
     res.json({
-      message: "Migração concluída com sucesso",
-      total: employees.length,
-      migrated,
-      skipped,
+      message: "Migração de metas semanais concluída com sucesso",
+      totalEmployees: employees.length,
+      totalWeeksCreated,
+      totalWeeksSkipped,
+      totalWeeks: totalWeeksCreated + totalWeeksSkipped,
       details: results
     });
   } catch (error) {
-    console.error("Erro ao migrar histórico:", error);
+    console.error("Erro ao migrar metas semanais:", error);
     res.status(500).json({ 
-      error: "Erro ao migrar dados históricos", 
+      error: "Erro ao migrar dados de metas semanais", 
       details: error.message 
     });
   }
