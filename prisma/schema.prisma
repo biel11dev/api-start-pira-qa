@@ -152,6 +152,7 @@ model Employee {
   createdAt   DateTime     @default(now()) // Data de criação do registro
   points      DailyPoint[] // Relacionamento com os pontos diários
   metaHistory EmployeeMetaHistory[] // Histórico de metas
+  weeklyMetas EmployeeWeeklyMeta[] // Metas por semana
 }
 
 model EmployeeMetaHistory {
@@ -177,6 +178,23 @@ model DailyPoint {
   falta      Boolean?  // Falta ou não
   employeeId Int      // Relacionamento com o funcionário
   employee   Employee @relation(fields: [employeeId], references: [id])
+}
+
+model EmployeeWeeklyMeta {
+  id          Int      @id @default(autoincrement())
+  employeeId  Int      // ID do funcionário
+  year        Int      // Ano da semana
+  month       Int      // Mês da semana
+  weekStart   DateTime // Data de início da semana (terça-feira)
+  metaHoras   Float    // Meta de horas semanais
+  bonificacao Float    // Valor da bonificação semanal
+  valorHora   Float    // Valor por hora (snapshot do momento)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  employee    Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  
+  @@unique([employeeId, weekStart])
+  @@index([employeeId, year, month])
 }
 
 model CadDespesa {

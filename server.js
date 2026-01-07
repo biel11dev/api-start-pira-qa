@@ -1934,6 +1934,146 @@ app.post("/api/employee-meta", async (req, res) => {
   }
 });
 
+// ROTAS DE METAS SEMANAIS DE FUNCIONÁRIOS
+// GET - Buscar meta semanal para um funcionário em uma semana específica
+app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
+  try {
+    const employeeId = parseInt(req.params.employeeId);
+    const { weekStart, year, month } = req.query;
+    
+    if (isNaN(employeeId)) {
+      return res.status(400).json({ error: "ID do funcionário inválido" });
+    }
+
+    let where = { employeeId };
+    
+    if (weekStart) {
+      // Buscar meta específica para uma semana
+      where.weekStart = new Date(weekStart);
+      
+      const meta = await prisma.employeeWeeklyMeta.findUnique({
+        where: {
+          employeeId_weekStart: {
+            employeeId,
+            weekStart: new Date(weekStart)
+          }
+        }
+      });
+
+      if (!meta) {
+        // Se não existe meta específica, retornar valores padrão do funcionário
+        const employee = await prisma.employee.findUnique({
+          where: { id: employeeId },
+          select: { valorHora: true, metaHoras: true, bonificacao: true }
+        });
+        
+        return res.json({
+          metaHoras: employee?.metaHoras || null,
+          bonificacao: employee?.bonificacao || null,
+          valorHora: employee?.valorHora || null,
+          isDefault: true
+        });
+      }
+
+      return res.json({
+        ...meta,
+        isDefault: false
+      });
+    }
+    
+    if (year && month) {
+      // Buscar todas as metas de um mês
+      where.year = parseInt(year);
+      where.month = parseInt(month);
+    }
+
+    const metas = await prisma.employeeWeeklyMeta.findMany({
+      where,
+      orderBy: { weekStart: 'asc' }
+    });
+
+    res.json(metas);
+  } catch (error) {
+    console.error("Erro ao buscar meta semanal:", error);
+    res.status(500).json({ error: "Erro ao buscar meta semanal", details: error.message });
+  }
+});
+
+// POST - Criar ou atualizar meta semanal
+app.post("/api/employee-weekly-meta", async (req, res) => {
+  try {
+    const { employeeId, weekStart, metaHoras, bonificacao, valorHora, year, month } = req.body;
+
+    if (!employeeId || !weekStart || metaHoras === undefined || bonificacao === undefined || valorHora === undefined) {
+      return res.status(400).json({ error: "Dados incompletos" });
+    }
+
+    const weekStartDate = new Date(weekStart);
+    weekStartDate.setHours(0, 0, 0, 0);
+
+    // Verificar se já existe meta para esta semana
+    const existingMeta = await prisma.employeeWeeklyMeta.findUnique({
+      where: {
+        employeeId_weekStart: {
+          employeeId: parseInt(employeeId),
+          weekStart: weekStartDate
+        }
+      }
+    });
+
+    let result;
+    if (existingMeta) {
+      // Atualizar meta existente
+      result = await prisma.employeeWeeklyMeta.update({
+        where: { id: existingMeta.id },
+        data: {
+          metaHoras: parseFloat(metaHoras),
+          bonificacao: parseFloat(bonificacao),
+          valorHora: parseFloat(valorHora)
+        }
+      });
+    } else {
+      // Criar nova meta
+      result = await prisma.employeeWeeklyMeta.create({
+        data: {
+          employeeId: parseInt(employeeId),
+          weekStart: weekStartDate,
+          year: year || weekStartDate.getFullYear(),
+          month: month || weekStartDate.getMonth() + 1,
+          metaHoras: parseFloat(metaHoras),
+          bonificacao: parseFloat(bonificacao),
+          valorHora: parseFloat(valorHora)
+        }
+      });
+    }
+
+    res.status(201).json(result);
+  } catch (error) {
+    console.error("Erro ao salvar meta semanal:", error);
+    res.status(500).json({ error: "Erro ao salvar meta semanal", details: error.message });
+  }
+});
+
+// DELETE - Deletar meta semanal (volta a usar valores padrão do funcionário)
+app.delete("/api/employee-weekly-meta/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    
+    if (isNaN(id)) {
+      return res.status(400).json({ error: "ID inválido" });
+    }
+
+    await prisma.employeeWeeklyMeta.delete({
+      where: { id }
+    });
+
+    res.json({ message: "Meta semanal excluída com sucesso" });
+  } catch (error) {
+    console.error("Erro ao excluir meta semanal:", error);
+    res.status(500).json({ error: "Erro ao excluir meta semanal", details: error.message });
+  }
+});
+
 // POST - Migrar dados históricos retroativos (executar uma única vez)
 app.post("/api/migrate-employee-meta-history", async (req, res) => {
   try {
@@ -1941,9 +2081,9 @@ app.post("/api/migrate-employee-meta-history", async (req, res) => {
     const employees = await prisma.employee.findMany({
       where: {
         OR: [
-          { valorHora: { not: 0 } },
-          { metaHoras: { not: 0 } },
-          { bonificacao: { not: 0 } }
+          { valorHora: { not: null } },
+          { metaHoras: { not: null } },
+          { bonificacao: { not: null } }
         ]
       }
     });
