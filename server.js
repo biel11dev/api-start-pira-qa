@@ -1941,9 +1941,9 @@ app.post("/api/migrate-employee-meta-history", async (req, res) => {
     const employees = await prisma.employee.findMany({
       where: {
         OR: [
-          { valorHora: { not: null } },
-          { metaHoras: { not: null } },
-          { bonificacao: { not: null } }
+          { valorHora: { not: 0 } },
+          { metaHoras: { not: 0 } },
+          { bonificacao: { not: 0 } }
         ]
       }
     });
