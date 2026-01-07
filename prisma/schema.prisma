@@ -186,6 +186,7 @@ model EmployeeWeeklyMeta {
   year        Int      // Ano da semana
   month       Int      // Mês da semana
   weekStart   DateTime // Data de início da semana (terça-feira)
+  weekEnd     DateTime // Data de fim da semana (domingo)
   metaHoras   Float    // Meta de horas semanais
   bonificacao Float    // Valor da bonificação semanal
   valorHora   Float    // Valor por hora (snapshot do momento)

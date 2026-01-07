@@ -1939,7 +1939,7 @@ app.post("/api/employee-meta", async (req, res) => {
 app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
   try {
     const employeeId = parseInt(req.params.employeeId);
-    const { weekStart, year, month } = req.query;
+    const { weekStart, year, month, date } = req.query;
     
     if (isNaN(employeeId)) {
       return res.status(400).json({ error: "ID do funcionário inválido" });
@@ -1948,7 +1948,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
     let where = { employeeId };
     
     if (weekStart) {
-      // Buscar meta específica para uma semana
+      // Buscar meta específica para uma semana pelo weekStart
       where.weekStart = new Date(weekStart);
       
       const meta = await prisma.employeeWeeklyMeta.findUnique({
@@ -1958,6 +1958,41 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
             weekStart: new Date(weekStart)
           }
         }
+      });
+
+      if (!meta) {
+        // Se não existe meta específica, retornar valores padrão do funcionário
+        const employee = await prisma.employee.findUnique({
+          where: { id: employeeId },
+          select: { valorHora: true, metaHoras: true, bonificacao: true }
+        });
+        
+        return res.json({
+          metaHoras: employee?.metaHoras || null,
+          bonificacao: employee?.bonificacao || null,
+          valorHora: employee?.valorHora || null,
+          isDefault: true
+        });
+      }
+
+      return res.json({
+        ...meta,
+        isDefault: false
+      });
+    }
+    
+    if (date) {
+      // Buscar meta para uma data específica (pode cair em qualquer dia da semana)
+      const searchDate = new Date(date);
+      searchDate.setHours(12, 0, 0, 0); // Meio-dia para evitar problemas de timezone
+      
+      const meta = await prisma.employeeWeeklyMeta.findFirst({
+        where: {
+          employeeId,
+          weekStart: { lte: searchDate },
+          weekEnd: { gte: searchDate }
+        },
+        orderBy: { weekStart: 'desc' }
       });
 
       if (!meta) {
@@ -2010,6 +2045,11 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
 
     const weekStartDate = new Date(weekStart);
     weekStartDate.setHours(0, 0, 0, 0);
+    
+    // Calcular weekEnd (domingo, 5 dias após a terça-feira)
+    const weekEndDate = new Date(weekStartDate);
+    weekEndDate.setDate(weekEndDate.getDate() + 5);
+    weekEndDate.setHours(23, 59, 59, 999);
 
     // Verificar se já existe meta para esta semana
     const existingMeta = await prisma.employeeWeeklyMeta.findUnique({
@@ -2027,6 +2067,7 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
       result = await prisma.employeeWeeklyMeta.update({
         where: { id: existingMeta.id },
         data: {
+          weekEnd: weekEndDate,
           metaHoras: parseFloat(metaHoras),
           bonificacao: parseFloat(bonificacao),
           valorHora: parseFloat(valorHora)
@@ -2038,6 +2079,7 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
         data: {
           employeeId: parseInt(employeeId),
           weekStart: weekStartDate,
+          weekEnd: weekEndDate,
           year: year || weekStartDate.getFullYear(),
           month: month || weekStartDate.getMonth() + 1,
           metaHoras: parseFloat(metaHoras),
