@@ -85,10 +85,10 @@ Equipe Start Pira`,
 
 // ROTAS DE AUTENTICAÇÃO
 app.post("/api/register", async (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, name } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = await prisma.user.create({ data: { username, password: hashedPassword } });
+    const newUser = await prisma.user.create({ data: { username, password: hashedPassword, name: name || null } });
     res.json(newUser);
   } catch (error) {
     console.log("Dados recebidos:", req.body); // Log dos dados recebidos
@@ -117,6 +117,8 @@ app.post("/api/login", async (req, res) => {
   // Inclua as permissões do usuário no retorno
   res.json({
     token,
+    username: user.username,
+    name: user.name,
     permissions: {
       caixa: user.caixa,
       produtos: user.produtos,
@@ -135,11 +137,14 @@ app.post("/api/login", async (req, res) => {
 app.put("/api/users/:id", async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
-    const { caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv } = req.body;
+    const { name, caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv } = req.body;
+
+    const updateData = { caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv };
+    if (name !== undefined) updateData.name = name;
 
     const updatedUser = await prisma.user.update({
       where: { id: userId },
-      data: { caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv  },
+      data: updateData,
     });
 
     res.json(updatedUser);
@@ -765,10 +770,16 @@ app.get("/api/employees", async (req, res) => {
       include: { points: true }, // Inclui os pontos diários relacionados
     });
 
-    // Adiciona um valor padrão para dailyHours se estiver null
+    // Adiciona valores padrão para campos se estiverem null
     const employeesWithDefaults = employees.map((employee) => ({
       ...employee,
-      carga: employee.carga || 8, // Define 8 como valor padrão
+      carga: employee.carga || 8,
+      valorHora: employee.valorHora || 0,
+      metaHoras: employee.metaHoras || null,
+      bonificacao: employee.bonificacao || null,
+      contato: employee.contato || null,
+      dataEntrada: employee.dataEntrada || null,
+      ativo: employee.ativo !== undefined ? employee.ativo : true,
     }));
 
     res.json(employeesWithDefaults);
@@ -794,9 +805,30 @@ app.get("/api/employees/:id", async (req, res) => {
 
 app.post("/api/employees", async (req, res) => {
   try {
-    const { name, position, carga = 8 } = req.body; // Define 8 como valor padrão
+    const { 
+      name, 
+      position, 
+      carga = 8,
+      valorHora = 0, 
+      metaHoras = null, 
+      bonificacao = null,
+      contato = null,
+      dataEntrada = null,
+      ativo = true
+    } = req.body;
+    
     const newEmployee = await prisma.employee.create({
-      data: { name, position, carga },
+      data: { 
+        name, 
+        position,
+        carga: parseInt(carga) || 8,
+        valorHora: parseFloat(valorHora) || 0,
+        metaHoras: metaHoras ? parseFloat(metaHoras) : null,
+        bonificacao: bonificacao ? parseFloat(bonificacao) : null,
+        contato,
+        dataEntrada: dataEntrada ? new Date(dataEntrada) : null,
+        ativo
+      },
     });
     res.status(201).json(newEmployee);
   } catch (error) {
@@ -806,10 +838,33 @@ app.post("/api/employees", async (req, res) => {
 
 app.put("/api/employees/:id", async (req, res) => {
   try {
-    const { name, position, carga } = req.body;
+    const { 
+      name, 
+      position,
+      carga,
+      valorHora, 
+      metaHoras, 
+      bonificacao,
+      contato,
+      dataEntrada,
+      ativo
+    } = req.body;
+    
+    // Construir objeto de atualização dinamicamente
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (position !== undefined) updateData.position = position;
+    if (carga !== undefined) updateData.carga = parseInt(carga) || 8;
+    if (valorHora !== undefined) updateData.valorHora = parseFloat(valorHora) || 0;
+    if (metaHoras !== undefined) updateData.metaHoras = metaHoras ? parseFloat(metaHoras) : null;
+    if (bonificacao !== undefined) updateData.bonificacao = bonificacao ? parseFloat(bonificacao) : null;
+    if (contato !== undefined) updateData.contato = contato;
+    if (dataEntrada !== undefined) updateData.dataEntrada = dataEntrada ? new Date(dataEntrada) : null;
+    if (ativo !== undefined) updateData.ativo = ativo;
+    
     const updatedEmployee = await prisma.employee.update({
       where: { id: parseInt(req.params.id) },
-      data: { name, position, carga },
+      data: updateData,
     });
     res.json(updatedEmployee);
   } catch (error) {
@@ -1631,7 +1686,7 @@ app.get("/api/desp-pessoal/:id", async (req, res) => {
 
 app.post("/api/desp-pessoal", async (req, res) => {
   try {
-    const { nomeDespesa, valorDespesa, descDespesa, date, DespesaFixa, categoriaId, tipoMovimento } = req.body;
+    const { nomeDespesa, valorDespesa, descDespesa, date, DespesaFixa, categoriaId, tipoMovimento, valeRelacionadoId } = req.body;
     console.log("Dados recebidos:", req.body);
 
     const parsedDate = new Date(date.replace(" ", "T"));
@@ -1646,6 +1701,7 @@ app.post("/api/desp-pessoal", async (req, res) => {
     
     if (valorDespesa !== undefined) data.valorDespesa = valorDespesa;
     if (descDespesa !== undefined) data.descDespesa = descDespesa;
+    if (valeRelacionadoId !== undefined) data.valeRelacionadoId = valeRelacionadoId;
 
     const newDespesa = await prisma.despPessoal.create({
       data,
@@ -1659,16 +1715,19 @@ app.post("/api/desp-pessoal", async (req, res) => {
 
 app.put("/api/desp-pessoal/:id", async (req, res) => {
   try {
-    const { nomeDespesa, valorDespesa, descDespesa, categoriaId, tipoMovimento } = req.body;
+    const { nomeDespesa, valorDespesa, descDespesa, categoriaId, tipoMovimento, valeRelacionadoId } = req.body;
+    
+    const updateData = {};
+    if (nomeDespesa !== undefined) updateData.nomeDespesa = nomeDespesa;
+    if (valorDespesa !== undefined) updateData.valorDespesa = valorDespesa;
+    if (descDespesa !== undefined) updateData.descDespesa = descDespesa;
+    if (categoriaId !== undefined) updateData.categoriaId = categoriaId || null;
+    if (tipoMovimento !== undefined) updateData.tipoMovimento = tipoMovimento;
+    if (valeRelacionadoId !== undefined) updateData.valeRelacionadoId = valeRelacionadoId;
+    
     const updatedDespesa = await prisma.despPessoal.update({
       where: { id: parseInt(req.params.id) },
-      data: { 
-        nomeDespesa, 
-        valorDespesa, 
-        descDespesa,
-        categoriaId: categoriaId || null,
-        tipoMovimento: tipoMovimento || "GASTO"
-      },
+      data: updateData,
       include: { categoria: true }
     });
     res.json(updatedDespesa);
@@ -1739,6 +1798,220 @@ app.delete("/api/cat-desp-pessoal/:id", async (req, res) => {
     res.json({ message: "Categoria de despesa pessoal excluída com sucesso" });
   } catch (error) {
     res.status(500).json({ error: "Erro ao excluir categoria de despesa pessoal", details: error.message });
+  }
+});
+
+// ROTAS DE HISTÓRICO DE METAS DE FUNCIONÁRIOS
+// GET - Buscar meta vigente para um funcionário em uma data específica
+app.get("/api/employee-meta/:employeeId", async (req, res) => {
+  try {
+    const employeeId = parseInt(req.params.employeeId);
+    const { date } = req.query; // formato: YYYY-MM-DD
+    
+    if (isNaN(employeeId)) {
+      return res.status(400).json({ error: "ID do funcionário inválido" });
+    }
+
+    const targetDate = date ? new Date(date) : new Date();
+
+    // Buscar meta vigente para a data
+    const meta = await prisma.employeeMetaHistory.findFirst({
+      where: {
+        employeeId,
+        validFrom: { lte: targetDate },
+        OR: [
+          { validUntil: null }, // Meta atual
+          { validUntil: { gte: targetDate } } // Meta que estava vigente
+        ]
+      },
+      orderBy: { validFrom: 'desc' }
+    });
+
+    if (!meta) {
+      // Se não houver histórico, retornar valores do Employee
+      const employee = await prisma.employee.findUnique({
+        where: { id: employeeId },
+        select: { valorHora: true, metaHoras: true, bonificacao: true }
+      });
+      
+      return res.json({
+        valorHora: employee?.valorHora || null,
+        metaHoras: employee?.metaHoras || null,
+        bonificacao: employee?.bonificacao || null,
+        isFromHistory: false
+      });
+    }
+
+    res.json({
+      valorHora: meta.valorHora,
+      metaHoras: meta.metaHoras,
+      bonificacao: meta.bonificacao,
+      validFrom: meta.validFrom,
+      validUntil: meta.validUntil,
+      isFromHistory: true
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar meta do funcionário", details: error.message });
+  }
+});
+
+// GET - Buscar todo o histórico de metas de um funcionário
+app.get("/api/employee-meta-history/:employeeId", async (req, res) => {
+  try {
+    const employeeId = parseInt(req.params.employeeId);
+    
+    if (isNaN(employeeId)) {
+      return res.status(400).json({ error: "ID do funcionário inválido" });
+    }
+
+    const history = await prisma.employeeMetaHistory.findMany({
+      where: { employeeId },
+      orderBy: { validFrom: 'desc' }
+    });
+
+    res.json(history);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar histórico de metas", details: error.message });
+  }
+});
+
+// POST - Criar nova meta (ao alterar meta de funcionário)
+app.post("/api/employee-meta", async (req, res) => {
+  try {
+    const { employeeId, valorHora, metaHoras, bonificacao, validFrom } = req.body;
+
+    if (!employeeId || valorHora === undefined || metaHoras === undefined || bonificacao === undefined) {
+      return res.status(400).json({ error: "Dados incompletos" });
+    }
+
+    const validFromDate = validFrom ? new Date(validFrom) : new Date();
+    // Garantir que é o primeiro dia do mês
+    validFromDate.setDate(1);
+    validFromDate.setHours(0, 0, 0, 0);
+
+    // Fechar meta anterior (se existir)
+    const lastMeta = await prisma.employeeMetaHistory.findFirst({
+      where: {
+        employeeId,
+        validUntil: null
+      },
+      orderBy: { validFrom: 'desc' }
+    });
+
+    if (lastMeta) {
+      // Fechar a meta anterior no último dia do mês anterior
+      const validUntil = new Date(validFromDate);
+      validUntil.setDate(0); // Último dia do mês anterior
+      validUntil.setHours(23, 59, 59, 999);
+
+      await prisma.employeeMetaHistory.update({
+        where: { id: lastMeta.id },
+        data: { validUntil }
+      });
+    }
+
+    // Criar nova meta
+    const newMeta = await prisma.employeeMetaHistory.create({
+      data: {
+        employeeId,
+        valorHora,
+        metaHoras,
+        bonificacao,
+        validFrom: validFromDate,
+        validUntil: null // Meta atual, sem data de fim
+      }
+    });
+
+    // Atualizar valores atuais no Employee
+    await prisma.employee.update({
+      where: { id: employeeId },
+      data: { valorHora, metaHoras, bonificacao }
+    });
+
+    res.status(201).json(newMeta);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao criar meta", details: error.message });
+  }
+});
+
+// POST - Migrar dados históricos retroativos (executar uma única vez)
+app.post("/api/migrate-employee-meta-history", async (req, res) => {
+  try {
+    // Buscar todos os funcionários com dados salariais
+    const employees = await prisma.employee.findMany({
+      where: {
+        OR: [
+          { valorHora: { not: null } },
+          { metaHoras: { not: null } },
+          { bonificacao: { not: null } }
+        ]
+      }
+    });
+
+    if (employees.length === 0) {
+      return res.json({ 
+        message: "Nenhum funcionário com dados salariais encontrado",
+        migrated: 0 
+      });
+    }
+
+    let migrated = 0;
+    let skipped = 0;
+    const results = [];
+
+    for (const employee of employees) {
+      // Verificar se já existe histórico para este funcionário
+      const existingHistory = await prisma.employeeMetaHistory.findFirst({
+        where: { employeeId: employee.id }
+      });
+
+      if (existingHistory) {
+        skipped++;
+        results.push({
+          employeeId: employee.id,
+          name: employee.name,
+          status: "skipped",
+          reason: "Já possui histórico"
+        });
+        continue;
+      }
+
+      // Criar registro histórico inicial
+      await prisma.employeeMetaHistory.create({
+        data: {
+          employeeId: employee.id,
+          valorHora: employee.valorHora || 0,
+          metaHoras: employee.metaHoras || 0,
+          bonificacao: employee.bonificacao || 0,
+          validFrom: employee.dataEntrada || employee.createdAt || new Date(2024, 0, 1),
+          validUntil: null // Meta atual
+        }
+      });
+
+      migrated++;
+      results.push({
+        employeeId: employee.id,
+        name: employee.name,
+        status: "migrated",
+        valorHora: employee.valorHora,
+        metaHoras: employee.metaHoras,
+        bonificacao: employee.bonificacao
+      });
+    }
+
+    res.json({
+      message: "Migração concluída com sucesso",
+      total: employees.length,
+      migrated,
+      skipped,
+      details: results
+    });
+  } catch (error) {
+    console.error("Erro ao migrar histórico:", error);
+    res.status(500).json({ 
+      error: "Erro ao migrar dados históricos", 
+      details: error.message 
+    });
   }
 });
 
