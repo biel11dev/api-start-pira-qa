@@ -1517,39 +1517,84 @@ app.delete("/api/categories/:id", async (req, res) => {
   }
 });
 
-// Rota para criar uma nova venda (PDV)
+// Rota para criar uma nova venda (PDV) com baixa de estoque
 app.post('/api/sales', async (req, res) => {
   try {
     const { items, total, paymentMethod, customerName, amountReceived, change, date } = req.body;
-    
-    // Criar registro da venda
-    const sale = await prisma.sale.create({
-      data: {
-        total: parseFloat(total),
-        paymentMethod,
-        customerName,
-        amountReceived: parseFloat(amountReceived) || total,
-        change: parseFloat(change) || 0,
-        date: parseISO(date),
-        items: {
-          create: items.map(item => ({
-            productId: item.id,
-            productName: item.name,
-            quantity: item.quantity,
-            unitPrice: item.price,
-            total: item.price * item.quantity
-          }))
-        }
-      },
-      include: {
-        items: true
+
+    // Verificar estoque antes de prosseguir
+    for (const item of items) {
+      const product = await prisma.product.findUnique({ where: { id: item.id } });
+      if (!product) {
+        return res.status(400).json({ error: `Produto "${item.name}" não encontrado no sistema.` });
       }
+      if (product.quantity < item.quantity) {
+        return res.status(400).json({ 
+          error: `Estoque insuficiente para "${item.name}". Disponível: ${product.quantity}, Solicitado: ${item.quantity}` 
+        });
+      }
+    }
+
+    // Usar transação para garantir consistência entre venda, estoque e movimentação
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Criar a venda
+      const sale = await tx.sale.create({
+        data: {
+          total: parseFloat(total),
+          paymentMethod,
+          customerName,
+          amountReceived: parseFloat(amountReceived) || total,
+          change: parseFloat(change) || 0,
+          date: parseISO(date),
+          items: {
+            create: items.map(item => ({
+              productId: item.id,
+              productName: item.name,
+              quantity: item.quantity,
+              unitPrice: item.price,
+              total: item.price * item.quantity
+            }))
+          }
+        },
+        include: {
+          items: true
+        }
+      });
+
+      // 2. Dar baixa no estoque e registrar movimentações
+      for (const item of items) {
+        const product = await tx.product.findUnique({ where: { id: item.id } });
+        const previousStock = product.quantity;
+        const newStock = previousStock - item.quantity;
+
+        // Atualizar quantidade do produto
+        await tx.product.update({
+          where: { id: item.id },
+          data: { quantity: newStock }
+        });
+
+        // Registrar movimentação de estoque
+        await tx.stockMovement.create({
+          data: {
+            productId: item.id,
+            type: 'SALE',
+            quantity: -item.quantity, // negativo = saída
+            previousStock: previousStock,
+            newStock: newStock,
+            description: `Venda #${sale.id} - ${item.name} (${item.quantity}x)`,
+            referenceId: sale.id,
+            referenceType: 'Sale'
+          }
+        });
+      }
+
+      return sale;
     });
 
-    res.status(201).json(sale);
+    res.status(201).json(result);
   } catch (error) {
     console.error('Erro ao criar venda:', error);
-    res.status(500).json({ error: 'Erro interno do servidor' });
+    res.status(500).json({ error: 'Erro interno do servidor', details: error.message });
   }
 });
 
@@ -1569,6 +1614,126 @@ app.get('/api/sales', async (req, res) => {
   } catch (error) {
     console.error('Erro ao buscar vendas:', error);
     res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+// ROTAS DE MOVIMENTAÇÕES DE ESTOQUE
+
+// Buscar todas as movimentações (com filtros opcionais)
+app.get('/api/stock-movements', async (req, res) => {
+  try {
+    const { productId, type, startDate, endDate, limit } = req.query;
+    
+    const where = {};
+    if (productId) where.productId = parseInt(productId);
+    if (type) where.type = type;
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) where.createdAt.gte = new Date(startDate);
+      if (endDate) where.createdAt.lte = new Date(endDate);
+    }
+
+    const movements = await prisma.stockMovement.findMany({
+      where,
+      include: {
+        product: {
+          select: { id: true, name: true, unit: true, quantity: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: limit ? parseInt(limit) : 100
+    });
+
+    res.json(movements);
+  } catch (error) {
+    console.error('Erro ao buscar movimentações:', error);
+    res.status(500).json({ error: 'Erro ao buscar movimentações', details: error.message });
+  }
+});
+
+// Buscar movimentações de um produto específico
+app.get('/api/stock-movements/product/:productId', async (req, res) => {
+  try {
+    const productId = parseInt(req.params.productId);
+    
+    const movements = await prisma.stockMovement.findMany({
+      where: { productId },
+      include: {
+        product: {
+          select: { id: true, name: true, unit: true, quantity: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    res.json(movements);
+  } catch (error) {
+    console.error('Erro ao buscar movimentações do produto:', error);
+    res.status(500).json({ error: 'Erro ao buscar movimentações', details: error.message });
+  }
+});
+
+// Registrar movimentação manual de estoque (entrada, ajuste, etc.)
+app.post('/api/stock-movements', async (req, res) => {
+  try {
+    const { productId, type, quantity, description } = req.body;
+
+    if (!productId || !type || quantity === undefined) {
+      return res.status(400).json({ error: 'productId, type e quantity são obrigatórios.' });
+    }
+
+    const validTypes = ['ENTRY', 'ADJUSTMENT', 'RETURN', 'LOSS'];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({ error: `Tipo inválido. Use: ${validTypes.join(', ')}` });
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const product = await tx.product.findUnique({ where: { id: parseInt(productId) } });
+      if (!product) {
+        throw new Error('Produto não encontrado');
+      }
+
+      const previousStock = product.quantity;
+      const parsedQty = parseFloat(quantity);
+      const newStock = previousStock + parsedQty; // positivo = entrada, negativo = saída
+
+      if (newStock < 0) {
+        throw new Error(`Estoque não pode ficar negativo. Estoque atual: ${previousStock}`);
+      }
+
+      // Atualizar estoque do produto
+      await tx.product.update({
+        where: { id: parseInt(productId) },
+        data: { quantity: newStock }
+      });
+
+      // Registrar movimentação
+      const movement = await tx.stockMovement.create({
+        data: {
+          productId: parseInt(productId),
+          type,
+          quantity: parsedQty,
+          previousStock,
+          newStock,
+          description: description || `${type} manual`,
+          referenceType: 'Manual'
+        },
+        include: {
+          product: {
+            select: { id: true, name: true, unit: true, quantity: true }
+          }
+        }
+      });
+
+      return movement;
+    });
+
+    res.status(201).json(result);
+  } catch (error) {
+    console.error('Erro ao registrar movimentação:', error);
+    res.status(error.message.includes('não') ? 400 : 500).json({ 
+      error: error.message || 'Erro ao registrar movimentação' 
+    });
   }
 });
 
