@@ -6,7 +6,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
 const { PrismaClient } = require("@prisma/client");
-const { format, parse } = require("date-fns");
+const { format, parse, parseISO } = require("date-fns");
 const nodemailer = require("nodemailer");
 const prisma = new PrismaClient();
 const app = express();
@@ -1686,7 +1686,7 @@ app.get("/api/desp-pessoal/:id", async (req, res) => {
 
 app.post("/api/desp-pessoal", async (req, res) => {
   try {
-    const { nomeDespesa, valorDespesa, descDespesa, date, DespesaFixa, categoriaId, tipoMovimento, valeRelacionadoId } = req.body;
+    const { nomeDespesa, valorDespesa, descDespesa, date, DespesaFixa, categoriaId, tipoMovimento, valeRelacionadoId, isVale } = req.body;
     console.log("Dados recebidos:", req.body);
 
     const parsedDate = new Date(date.replace(" ", "T"));
@@ -1695,13 +1695,18 @@ app.post("/api/desp-pessoal", async (req, res) => {
       nomeDespesa, 
       date: parsedDate, 
       DespesaFixa,
-      tipoMovimento: tipoMovimento || "GASTO",
-      categoriaId: categoriaId || null
+      tipoMovimento: tipoMovimento || "GASTO"
     };
+    
+    // Adicionar categoria usando relação
+    if (categoriaId) {
+      data.categoria = { connect: { id: categoriaId } };
+    }
     
     if (valorDespesa !== undefined) data.valorDespesa = valorDespesa;
     if (descDespesa !== undefined) data.descDespesa = descDespesa;
     if (valeRelacionadoId !== undefined) data.valeRelacionadoId = valeRelacionadoId;
+    if (isVale !== undefined) data.isVale = isVale;
 
     const newDespesa = await prisma.despPessoal.create({
       data,
@@ -1715,15 +1720,31 @@ app.post("/api/desp-pessoal", async (req, res) => {
 
 app.put("/api/desp-pessoal/:id", async (req, res) => {
   try {
-    const { nomeDespesa, valorDespesa, descDespesa, categoriaId, tipoMovimento, valeRelacionadoId } = req.body;
+    const { nomeDespesa, valorDespesa, descDespesa, date, DespesaFixa, categoriaId, tipoMovimento, valeRelacionadoId, isVale } = req.body;
     
     const updateData = {};
     if (nomeDespesa !== undefined) updateData.nomeDespesa = nomeDespesa;
     if (valorDespesa !== undefined) updateData.valorDespesa = valorDespesa;
     if (descDespesa !== undefined) updateData.descDespesa = descDespesa;
-    if (categoriaId !== undefined) updateData.categoriaId = categoriaId || null;
     if (tipoMovimento !== undefined) updateData.tipoMovimento = tipoMovimento;
     if (valeRelacionadoId !== undefined) updateData.valeRelacionadoId = valeRelacionadoId;
+    if (DespesaFixa !== undefined) updateData.DespesaFixa = DespesaFixa;
+    if (isVale !== undefined) updateData.isVale = isVale;
+    
+    // Atualizar categoria usando relação
+    if (categoriaId !== undefined) {
+      if (categoriaId === null) {
+        updateData.categoria = { disconnect: true };
+      } else {
+        updateData.categoria = { connect: { id: categoriaId } };
+      }
+    }
+    
+    // Processar data se fornecida
+    if (date !== undefined) {
+      const parsedDate = new Date(date.replace(" ", "T"));
+      updateData.date = parsedDate;
+    }
     
     const updatedDespesa = await prisma.despPessoal.update({
       where: { id: parseInt(req.params.id) },
