@@ -409,18 +409,44 @@ app.delete("/api/daily-readings/:id", async (req, res) => {
 });
 
 // ROTAS DE PRODUTOS (CORREÇÃO DO ERRO `quantity`)
-app.get("/api/estoque_prod", async (req, res) => res.json(await prisma.estoque.findMany()));
+app.get("/api/estoque_prod", async (req, res) => {
+  try {
+    const produtos = await prisma.estoque.findMany({
+      include: {
+        category: {
+          include: {
+            parent: true
+          }
+        }
+      }
+    });
+    res.json(produtos);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar estoque", details: error.message });
+  }
+});
 
 app.get("/api/estoque_prod/:id", async (req, res) => {
-  const product = await prisma.estoque.findUnique({
-    where: { id: parseInt(req.params.id) },
-  });
-  res.json(product || { error: "Produto não encontrado" });
+  try {
+    const product = await prisma.estoque.findUnique({
+      where: { id: parseInt(req.params.id) },
+      include: {
+        category: {
+          include: {
+            parent: true
+          }
+        }
+      }
+    });
+    res.json(product || { error: "Produto não encontrado" });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar produto", details: error.message });
+  }
 });
 
 app.post("/api/estoque_prod", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -442,7 +468,21 @@ app.post("/api/estoque_prod", async (req, res) => {
     }
 
     const newProduct = await prisma.estoque.create({
-      data: { name, quantity: parsedQuantity, unit, value: parsedValue, valuecusto: parsedValueCusto },
+      data: { 
+        name, 
+        quantity: parsedQuantity, 
+        unit, 
+        value: parsedValue, 
+        valuecusto: parsedValueCusto,
+        categoria_Id: categoryId ? parseInt(categoryId) : null
+      },
+      include: {
+        category: {
+          include: {
+            parent: true
+          }
+        }
+      }
     });
 
     res.status(201).json(newProduct);
@@ -453,7 +493,7 @@ app.post("/api/estoque_prod", async (req, res) => {
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -476,7 +516,21 @@ app.put("/api/estoque_prod/:id", async (req, res) => {
 
     const updatedProduct = await prisma.estoque.update({
       where: { id: parseInt(req.params.id) },
-      data: { name, quantity: parsedQuantity, unit, value: parsedValue, valuecusto: parsedValueCusto },
+      data: { 
+        name, 
+        quantity: parsedQuantity, 
+        unit, 
+        value: parsedValue, 
+        valuecusto: parsedValueCusto,
+        categoria_Id: categoryId ? parseInt(categoryId) : null
+      },
+      include: {
+        category: {
+          include: {
+            parent: true
+          }
+        }
+      }
     });
 
     res.json(updatedProduct);
@@ -1522,15 +1576,15 @@ app.post('/api/sales', async (req, res) => {
   try {
     const { items, total, paymentMethod, customerName, amountReceived, change, date } = req.body;
 
-    // Verificar estoque antes de prosseguir
+    // Verificar estoque antes de prosseguir (busca na tabela Estoque)
     for (const item of items) {
-      const product = await prisma.product.findUnique({ where: { id: item.id } });
-      if (!product) {
-        return res.status(400).json({ error: `Produto "${item.name}" não encontrado no sistema.` });
+      const estoqueItem = await prisma.estoque.findUnique({ where: { id: item.id } });
+      if (!estoqueItem) {
+        return res.status(400).json({ error: `Produto "${item.name}" não encontrado no estoque.` });
       }
-      if (product.quantity < item.quantity) {
+      if (estoqueItem.quantity < item.quantity) {
         return res.status(400).json({ 
-          error: `Estoque insuficiente para "${item.name}". Disponível: ${product.quantity}, Solicitado: ${item.quantity}` 
+          error: `Estoque insuficiente para "${item.name}". Disponível: ${estoqueItem.quantity}, Solicitado: ${item.quantity}` 
         });
       }
     }
@@ -1548,7 +1602,7 @@ app.post('/api/sales', async (req, res) => {
           date: parseISO(date),
           items: {
             create: items.map(item => ({
-              productId: item.id,
+              estoqueId: item.id,
               productName: item.name,
               quantity: item.quantity,
               unitPrice: item.price,
@@ -1561,14 +1615,14 @@ app.post('/api/sales', async (req, res) => {
         }
       });
 
-      // 2. Dar baixa no estoque e registrar movimentações
+      // 2. Dar baixa no ESTOQUE e registrar movimentações
       for (const item of items) {
-        const product = await tx.product.findUnique({ where: { id: item.id } });
-        const previousStock = product.quantity;
+        const estoqueItem = await tx.estoque.findUnique({ where: { id: item.id } });
+        const previousStock = estoqueItem.quantity;
         const newStock = previousStock - item.quantity;
 
-        // Atualizar quantidade do produto
-        await tx.product.update({
+        // Atualizar quantidade no estoque
+        await tx.estoque.update({
           where: { id: item.id },
           data: { quantity: newStock }
         });
@@ -1576,7 +1630,7 @@ app.post('/api/sales', async (req, res) => {
         // Registrar movimentação de estoque
         await tx.stockMovement.create({
           data: {
-            productId: item.id,
+            estoqueId: item.id,
             type: 'SALE',
             quantity: -item.quantity, // negativo = saída
             previousStock: previousStock,
@@ -1622,10 +1676,10 @@ app.get('/api/sales', async (req, res) => {
 // Buscar todas as movimentações (com filtros opcionais)
 app.get('/api/stock-movements', async (req, res) => {
   try {
-    const { productId, type, startDate, endDate, limit } = req.query;
+    const { estoqueId, type, startDate, endDate, limit } = req.query;
     
     const where = {};
-    if (productId) where.productId = parseInt(productId);
+    if (estoqueId) where.estoqueId = parseInt(estoqueId);
     if (type) where.type = type;
     if (startDate || endDate) {
       where.createdAt = {};
@@ -1636,7 +1690,7 @@ app.get('/api/stock-movements', async (req, res) => {
     const movements = await prisma.stockMovement.findMany({
       where,
       include: {
-        product: {
+        estoque: {
           select: { id: true, name: true, unit: true, quantity: true }
         }
       },
@@ -1651,15 +1705,15 @@ app.get('/api/stock-movements', async (req, res) => {
   }
 });
 
-// Buscar movimentações de um produto específico
-app.get('/api/stock-movements/product/:productId', async (req, res) => {
+// Buscar movimentações de um item do estoque específico
+app.get('/api/stock-movements/estoque/:estoqueId', async (req, res) => {
   try {
-    const productId = parseInt(req.params.productId);
+    const estoqueId = parseInt(req.params.estoqueId);
     
     const movements = await prisma.stockMovement.findMany({
-      where: { productId },
+      where: { estoqueId },
       include: {
-        product: {
+        estoque: {
           select: { id: true, name: true, unit: true, quantity: true }
         }
       },
@@ -1676,10 +1730,10 @@ app.get('/api/stock-movements/product/:productId', async (req, res) => {
 // Registrar movimentação manual de estoque (entrada, ajuste, etc.)
 app.post('/api/stock-movements', async (req, res) => {
   try {
-    const { productId, type, quantity, description } = req.body;
+    const { estoqueId, type, quantity, description } = req.body;
 
-    if (!productId || !type || quantity === undefined) {
-      return res.status(400).json({ error: 'productId, type e quantity são obrigatórios.' });
+    if (!estoqueId || !type || quantity === undefined) {
+      return res.status(400).json({ error: 'estoqueId, type e quantity são obrigatórios.' });
     }
 
     const validTypes = ['ENTRY', 'ADJUSTMENT', 'RETURN', 'LOSS'];
@@ -1688,12 +1742,12 @@ app.post('/api/stock-movements', async (req, res) => {
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      const product = await tx.product.findUnique({ where: { id: parseInt(productId) } });
-      if (!product) {
-        throw new Error('Produto não encontrado');
+      const estoqueItem = await tx.estoque.findUnique({ where: { id: parseInt(estoqueId) } });
+      if (!estoqueItem) {
+        throw new Error('Produto não encontrado no estoque');
       }
 
-      const previousStock = product.quantity;
+      const previousStock = estoqueItem.quantity;
       const parsedQty = parseFloat(quantity);
       const newStock = previousStock + parsedQty; // positivo = entrada, negativo = saída
 
@@ -1701,16 +1755,16 @@ app.post('/api/stock-movements', async (req, res) => {
         throw new Error(`Estoque não pode ficar negativo. Estoque atual: ${previousStock}`);
       }
 
-      // Atualizar estoque do produto
-      await tx.product.update({
-        where: { id: parseInt(productId) },
+      // Atualizar quantidade no estoque
+      await tx.estoque.update({
+        where: { id: parseInt(estoqueId) },
         data: { quantity: newStock }
       });
 
       // Registrar movimentação
       const movement = await tx.stockMovement.create({
         data: {
-          productId: parseInt(productId),
+          estoqueId: parseInt(estoqueId),
           type,
           quantity: parsedQty,
           previousStock,
@@ -1719,7 +1773,7 @@ app.post('/api/stock-movements', async (req, res) => {
           referenceType: 'Manual'
         },
         include: {
-          product: {
+          estoque: {
             select: { id: true, name: true, unit: true, quantity: true }
           }
         }

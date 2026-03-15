@@ -92,8 +92,6 @@ model Product {
   updatedAt DateTime? @updatedAt
   value     Float
   valuecusto Float
-  stockMovements StockMovement[]
-  saleItems      SaleItem[]
 }
 
 model Estoque {
@@ -107,6 +105,8 @@ model Estoque {
   updatedAt DateTime? @updatedAt
   value     Float
   valuecusto Float
+  stockMovements StockMovement[]
+  saleItems      SaleItem[]
 }
 
 model Purchase {
@@ -231,21 +231,21 @@ model Sale {
 }
 
 model SaleItem {
-  id          Int    @id @default(autoincrement())
+  id          Int      @id @default(autoincrement())
   saleId      Int
-  productId   Int
+  estoqueId   Int
   productName String
   quantity    Float
   unitPrice   Float
   total       Float
-  sale        Sale   @relation(fields: [saleId], references: [id])
-  product     Product @relation(fields: [productId], references: [id])
+  sale        Sale     @relation(fields: [saleId], references: [id])
+  estoque     Estoque  @relation(fields: [estoqueId], references: [id])
 }
 
 model StockMovement {
   id            Int      @id @default(autoincrement())
-  productId     Int
-  product       Product  @relation(fields: [productId], references: [id])
+  estoqueId     Int
+  estoque       Estoque  @relation(fields: [estoqueId], references: [id])
   type          String   // SALE, ADJUSTMENT, ENTRY, RETURN
   quantity      Float    // quantidade movimentada (positivo = entrada, negativo = saída)
   previousStock Int      // estoque antes da movimentação
@@ -255,7 +255,7 @@ model StockMovement {
   referenceType String?  // "Sale", "Manual", etc.
   createdAt     DateTime @default(now())
 
-  @@index([productId])
+  @@index([estoqueId])
   @@index([type])
   @@index([createdAt])
 }
