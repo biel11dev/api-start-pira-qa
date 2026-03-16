@@ -408,11 +408,12 @@ app.delete("/api/daily-readings/:id", async (req, res) => {
   }
 });
 
-// ROTAS DE PRODUTOS (CORREÇÃO DO ERRO `quantity`)
+// ROTAS DE ESTOQUE
 app.get("/api/estoque_prod", async (req, res) => {
   try {
     const produtos = await prisma.estoque.findMany({
       include: {
+        product: true,
         category: {
           include: {
             parent: true
@@ -431,6 +432,7 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
     const product = await prisma.estoque.findUnique({
       where: { id: parseInt(req.params.id) },
       include: {
+        product: true,
         category: {
           include: {
             parent: true
@@ -444,9 +446,242 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
   }
 });
 
+// Entrada de estoque - seleciona do catálogo, verifica se já existe, incrementa ou cria
+app.post("/api/estoque_prod/entrada", async (req, res) => {
+  try {
+    const { productId, quantity, unit } = req.body;
+
+    if (!productId || !quantity || !unit) {
+      return res.status(400).json({ error: "productId, quantity e unit são obrigatórios." });
+    }
+
+    const parsedQuantity = parseInt(quantity, 10);
+    if (isNaN(parsedQuantity) || parsedQuantity <= 0) {
+      return res.status(400).json({ error: "Quantidade deve ser um número válido maior que zero." });
+    }
+
+    // Buscar o produto no catálogo
+    const catalogProduct = await prisma.product.findUnique({ 
+      where: { id: parseInt(productId) },
+      include: { category: { include: { parent: true } } }
+    });
+    if (!catalogProduct) {
+      return res.status(404).json({ error: "Produto não encontrado no catálogo." });
+    }
+
+    // Verificar se já existe no estoque com mesmo productId e mesma unidade
+    const existingStock = await prisma.estoque.findFirst({
+      where: { productId: parseInt(productId), unit: unit }
+    });
+
+    const result = await prisma.$transaction(async (tx) => {
+      let estoqueItem;
+
+      if (existingStock) {
+        // Incrementar quantidade no registro existente
+        const previousStock = existingStock.quantity;
+        const newStock = previousStock + parsedQuantity;
+
+        estoqueItem = await tx.estoque.update({
+          where: { id: existingStock.id },
+          data: { 
+            quantity: newStock,
+            value: catalogProduct.value,
+            valuecusto: catalogProduct.valuecusto
+          },
+          include: { product: true, category: { include: { parent: true } } }
+        });
+
+        // Registrar movimentação
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: existingStock.id,
+            type: 'ENTRY',
+            quantity: parsedQuantity,
+            previousStock: previousStock,
+            newStock: newStock,
+            description: `Entrada de ${parsedQuantity}x ${unit} - ${catalogProduct.name}`,
+            referenceType: 'Manual'
+          }
+        });
+      } else {
+        // Criar novo registro no estoque
+        estoqueItem = await tx.estoque.create({
+          data: {
+            productId: parseInt(productId),
+            name: catalogProduct.name,
+            quantity: parsedQuantity,
+            unit: unit,
+            value: catalogProduct.value,
+            valuecusto: catalogProduct.valuecusto,
+            categoria_Id: catalogProduct.categoryId || null
+          },
+          include: { product: true, category: { include: { parent: true } } }
+        });
+
+        // Registrar movimentação
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: estoqueItem.id,
+            type: 'ENTRY',
+            quantity: parsedQuantity,
+            previousStock: 0,
+            newStock: parsedQuantity,
+            description: `Entrada inicial de ${parsedQuantity}x ${unit} - ${catalogProduct.name}`,
+            referenceType: 'Manual'
+          }
+        });
+      }
+
+      return estoqueItem;
+    });
+
+    res.status(201).json(result);
+  } catch (error) {
+    console.error("Erro na entrada de estoque:", error);
+    res.status(500).json({ error: "Erro ao registrar entrada no estoque", details: error.message });
+  }
+});
+
+// Conversão de unidades - ex: 1 Fardo (12un) → 12 Unidades
+app.post("/api/estoque_prod/converter", async (req, res) => {
+  try {
+    const { estoqueId, quantityToConvert } = req.body;
+
+    if (!estoqueId || !quantityToConvert) {
+      return res.status(400).json({ error: "estoqueId e quantityToConvert são obrigatórios." });
+    }
+
+    const parsedQty = parseInt(quantityToConvert, 10);
+    if (isNaN(parsedQty) || parsedQty <= 0) {
+      return res.status(400).json({ error: "Quantidade deve ser um número válido maior que zero." });
+    }
+
+    // Buscar o item no estoque
+    const estoqueItem = await prisma.estoque.findUnique({
+      where: { id: parseInt(estoqueId) },
+      include: { product: true }
+    });
+    if (!estoqueItem) {
+      return res.status(404).json({ error: "Item não encontrado no estoque." });
+    }
+
+    if (estoqueItem.unit === "Unidade") {
+      return res.status(400).json({ error: "Este item já está em Unidades, não é possível converter." });
+    }
+
+    if (estoqueItem.quantity < parsedQty) {
+      return res.status(400).json({ 
+        error: `Quantidade insuficiente. Disponível: ${estoqueItem.quantity} ${estoqueItem.unit}(s)` 
+      });
+    }
+
+    // Buscar fator de conversão
+    const equivalence = await prisma.unitEquivalence.findUnique({
+      where: { unitName: estoqueItem.unit }
+    });
+    if (!equivalence) {
+      return res.status(400).json({ 
+        error: `Equivalência não definida para "${estoqueItem.unit}". Cadastre a equivalência primeiro.` 
+      });
+    }
+
+    const unitsGenerated = parsedQty * equivalence.value;
+    const unitValueSell = estoqueItem.value / equivalence.value;
+    const unitValueCost = estoqueItem.valuecusto / equivalence.value;
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Diminuir quantidade do item original
+      const previousStock = estoqueItem.quantity;
+      const newStock = previousStock - parsedQty;
+
+      await tx.estoque.update({
+        where: { id: estoqueItem.id },
+        data: { quantity: newStock }
+      });
+
+      // Registrar movimentação de saída (conversão)
+      await tx.stockMovement.create({
+        data: {
+          estoqueId: estoqueItem.id,
+          type: 'CONVERSION_OUT',
+          quantity: -parsedQty,
+          previousStock: previousStock,
+          newStock: newStock,
+          description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x Unidade`,
+          referenceType: 'Conversion'
+        }
+      });
+
+      // 2. Verificar se já existe registro em Unidade para este produto
+      const existingUnitStock = await tx.estoque.findFirst({
+        where: { productId: estoqueItem.productId, unit: "Unidade" }
+      });
+
+      let unitEstoqueItem;
+      if (existingUnitStock) {
+        const prevUnitStock = existingUnitStock.quantity;
+        const newUnitStock = prevUnitStock + unitsGenerated;
+
+        unitEstoqueItem = await tx.estoque.update({
+          where: { id: existingUnitStock.id },
+          data: { quantity: newUnitStock }
+        });
+
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: existingUnitStock.id,
+            type: 'CONVERSION_IN',
+            quantity: unitsGenerated,
+            previousStock: prevUnitStock,
+            newStock: newUnitStock,
+            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x Unidade`,
+            referenceType: 'Conversion'
+          }
+        });
+      } else {
+        unitEstoqueItem = await tx.estoque.create({
+          data: {
+            productId: estoqueItem.productId,
+            name: estoqueItem.name,
+            quantity: unitsGenerated,
+            unit: "Unidade",
+            value: Math.round(unitValueSell * 100) / 100,
+            valuecusto: Math.round(unitValueCost * 100) / 100,
+            categoria_Id: estoqueItem.categoria_Id
+          }
+        });
+
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: unitEstoqueItem.id,
+            type: 'CONVERSION_IN',
+            quantity: unitsGenerated,
+            previousStock: 0,
+            newStock: unitsGenerated,
+            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x Unidade (novo registro)`,
+            referenceType: 'Conversion'
+          }
+        });
+      }
+
+      return {
+        origin: { id: estoqueItem.id, name: estoqueItem.name, unit: estoqueItem.unit, removed: parsedQty, remaining: newStock },
+        destination: { id: unitEstoqueItem.id, name: estoqueItem.name, unit: "Unidade", added: unitsGenerated, total: unitEstoqueItem.quantity },
+        conversionFactor: equivalence.value
+      };
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error("Erro na conversão de unidade:", error);
+    res.status(500).json({ error: "Erro ao converter unidade", details: error.message });
+  }
+});
+
 app.post("/api/estoque_prod", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, productId } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -474,9 +709,11 @@ app.post("/api/estoque_prod", async (req, res) => {
         unit, 
         value: parsedValue, 
         valuecusto: parsedValueCusto,
-        categoria_Id: categoryId ? parseInt(categoryId) : null
+        categoria_Id: categoryId ? parseInt(categoryId) : null,
+        productId: productId ? parseInt(productId) : null
       },
       include: {
+        product: true,
         category: {
           include: {
             parent: true
@@ -525,6 +762,7 @@ app.put("/api/estoque_prod/:id", async (req, res) => {
         categoria_Id: categoryId ? parseInt(categoryId) : null
       },
       include: {
+        product: true,
         category: {
           include: {
             parent: true
