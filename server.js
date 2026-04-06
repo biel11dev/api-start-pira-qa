@@ -3519,6 +3519,80 @@ app.post("/api/pdv-config/init", async (req, res) => {
   }
 });
 
+// ROTAS CONFIG VENDA — FORMAS DE PAGAMENTO
+app.get("/api/pdv-formas-pagamento", async (req, res) => {
+  try {
+    const formas = await prisma.pdvFormaPagamento.findMany({ orderBy: { nome: "asc" } });
+    res.json(formas);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar formas de pagamento", details: error.message });
+  }
+});
+
+app.post("/api/pdv-formas-pagamento", async (req, res) => {
+  try {
+    const { nome } = req.body;
+    if (!nome || !nome.trim()) {
+      return res.status(400).json({ error: "Nome é obrigatório" });
+    }
+    const valor = nome.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, "_");
+    const forma = await prisma.pdvFormaPagamento.create({
+      data: { nome: nome.trim(), valor },
+    });
+    res.status(201).json(forma);
+  } catch (error) {
+    if (error.code === "P2002") {
+      return res.status(400).json({ error: "Já existe uma forma de pagamento com esse nome" });
+    }
+    res.status(500).json({ error: "Erro ao criar forma de pagamento", details: error.message });
+  }
+});
+
+app.put("/api/pdv-formas-pagamento/:id", async (req, res) => {
+  try {
+    const { ativo } = req.body;
+    const forma = await prisma.pdvFormaPagamento.update({
+      where: { id: parseInt(req.params.id) },
+      data: { ativo },
+    });
+    res.json(forma);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao atualizar forma de pagamento", details: error.message });
+  }
+});
+
+app.delete("/api/pdv-formas-pagamento/:id", async (req, res) => {
+  try {
+    await prisma.pdvFormaPagamento.delete({ where: { id: parseInt(req.params.id) } });
+    res.json({ message: "Forma de pagamento excluída" });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao excluir forma de pagamento", details: error.message });
+  }
+});
+
+app.post("/api/pdv-formas-pagamento/init", async (req, res) => {
+  try {
+    const defaults = [
+      { nome: "Dinheiro", valor: "dinheiro" },
+      { nome: "Cartão", valor: "cartao" },
+      { nome: "PIX", valor: "pix" },
+      { nome: "Fiado", valor: "fiado" },
+    ];
+    const results = [];
+    for (const d of defaults) {
+      const f = await prisma.pdvFormaPagamento.upsert({
+        where: { nome: d.nome },
+        update: {},
+        create: { nome: d.nome, valor: d.valor, ativo: true },
+      });
+      results.push(f);
+    }
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao inicializar formas de pagamento", details: error.message });
+  }
+});
+
 // Buscar comandas pendentes (clientes com débito > 0)
 app.get("/api/pdv-comandas-pendentes", async (req, res) => {
   try {
