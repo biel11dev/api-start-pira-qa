@@ -322,3 +322,97 @@ model AuditoriaConfig {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
+
+model PdvCaixaMovimento {
+  id          Int      @id @default(autoincrement())
+  tipo        String   // "ADD", "SANGRIA", etc.
+  valor       Float
+  origens     PdvCaixaOrigem[]
+  userId      Int?
+  userName    String?
+  observacao  String?
+  createdAt   DateTime @default(now())
+
+  @@index([tipo])
+  @@index([createdAt])
+}
+
+model PdvCaixaOrigem {
+  id            Int      @id @default(autoincrement())
+  movimentoId   Int
+  movimento     PdvCaixaMovimento @relation(fields: [movimentoId], references: [id], onDelete: Cascade)
+  nome          String   // Nome da origem (ex: "Cofre", "Banco", "Pessoal")
+  valor         Float
+  createdAt     DateTime @default(now())
+
+  @@index([movimentoId])
+}
+
+model PdvOrigemConfig {
+  id        Int      @id @default(autoincrement())
+  nome      String   @unique
+  ativo     Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PdvPremio {
+  id          Int      @id @default(autoincrement())
+  imagem1     String   @db.Text // Base64 - prova do ganho no caça-níquel
+  imagem2     String   @db.Text // Base64 - prova da baixa do valor no jogo
+  valor       Float
+  observacao  String?
+  userId      Int?
+  userName    String?
+  origens     PdvPremioOrigem[]
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+model PdvPremioOrigem {
+  id          Int      @id @default(autoincrement())
+  premioId    Int
+  premio      PdvPremio @relation(fields: [premioId], references: [id], onDelete: Cascade)
+  nome        String
+  valor       Float
+  createdAt   DateTime @default(now())
+
+  @@index([premioId])
+}
+
+model PdvCupom {
+  id              Int       @id @default(autoincrement())
+  codigo          String    @unique
+  tipo            String    // "PERCENTUAL" ou "FIXO"
+  valor           Float     // Percentual (ex: 10) ou valor fixo (ex: 5.00)
+  descricao       String?
+  validoAte       DateTime?
+  limiteUso       Int?      // null = ilimitado
+  vezesUsado      Int       @default(0)
+  ativo           Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([codigo])
+  @@index([ativo])
+}
+
+model PdvTaxaMaquina {
+  id          Int      @id @default(autoincrement())
+  nome        String   // Ex: "Taxa cartão crédito", "Taxa PIX"
+  tipo        String   // "PERCENTUAL" ou "FIXO"
+  valor       Float
+  ativo       Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model PdvConfigVenda {
+  id              Int      @id @default(autoincrement())
+  chave           String   @unique  // Ex: "limite_comanda", "max_comandas_abertas"
+  valor           String   // Armazena o valor como string (flex)
+  descricao       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}

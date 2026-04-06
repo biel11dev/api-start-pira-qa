@@ -28,7 +28,7 @@ app.use(
   })
 );
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "15mb" }));
 app.use(morgan("dev"));
 
 // Middleware de autenticação
@@ -50,6 +50,7 @@ const rotaParaModulo = (rota) => {
   if (rota.includes("/api/balance")) return "caixa";
   if (rota.includes("/api/sales")) return "pdv";
   if (rota.includes("/api/estoque")) return "pdv";
+  if (rota.includes("/api/pdv-caixa") || rota.includes("/api/pdv-origens")) return "pdv";
   if (rota.includes("/api/products")) return "produtos";
   if (rota.includes("/api/categories")) return "estoque";
   if (rota.includes("/api/unit-equivalences")) return "estoque";
@@ -57,7 +58,7 @@ const rotaParaModulo = (rota) => {
   if (rota.includes("/api/machines")) return "maquinas";
   if (rota.includes("/api/machine-week")) return "maquinas";
   if (rota.includes("/api/daily-readings")) return "maquinas";
-  if (rota.includes("/api/clients")) return "fiado";
+  if (rota.includes("/api/clients")) return "fiado";  
   if (rota.includes("/api/purchases")) return "fiado";
   if (rota.includes("/api/payments")) return "fiado";
   if (rota.includes("/api/despesas") || rota.includes("/api/cadastrodesp")) return "despesas";
@@ -90,9 +91,22 @@ const auditoriaMiddleware = async (req, res, next) => {
         return originalJson(body);
       }
 
-      // Tenta obter dados do usuário
+      // Tenta obter dados do usuário a partir do token JWT
       let userId = req.userId || null;
       let userName = null;
+
+      // Tenta extrair userId do token mesmo sem authenticate middleware
+      if (!userId) {
+        try {
+          const authHeader = req.headers.authorization;
+          if (authHeader && authHeader.startsWith("Bearer ")) {
+            const token = authHeader.split(" ")[1];
+            const decoded = jwt.verify(token, SECRET_KEY);
+            userId = decoded.userId || null;
+          }
+        } catch (e) { /* token inválido ou ausente, ignora */ }
+      }
+
       if (userId) {
         try {
           const user = await prisma.user.findUnique({ where: { id: userId } });
@@ -3034,6 +3048,491 @@ app.post("/api/migrate-employee-meta-history", async (req, res) => {
       error: "Erro ao migrar dados de metas semanais", 
       details: error.message 
     });
+  }
+});
+
+// ROTAS DE PDV - MOVIMENTAÇÕES DE CAIXA
+
+// Buscar origens configuradas
+app.get("/api/pdv-origens", async (req, res) => {
+  try {
+    const origens = await prisma.pdvOrigemConfig.findMany({
+      where: { ativo: true },
+      orderBy: { nome: "asc" },
+    });
+    res.json(origens);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar origens", details: error.message });
+  }
+});
+
+// Criar/gerenciar origens
+app.post("/api/pdv-origens", async (req, res) => {
+  try {
+    const { nome } = req.body;
+    const origem = await prisma.pdvOrigemConfig.create({ data: { nome } });
+    res.status(201).json(origem);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao criar origem", details: error.message });
+  }
+});
+
+app.delete("/api/pdv-origens/:id", async (req, res) => {
+  try {
+    await prisma.pdvOrigemConfig.delete({ where: { id: parseInt(req.params.id) } });
+    res.json({ message: "Origem excluída com sucesso" });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao excluir origem", details: error.message });
+  }
+});
+
+// Registrar movimentação de caixa (ADD, SANGRIA, etc.)
+app.post("/api/pdv-caixa-movimento", async (req, res) => {
+  try {
+    const { tipo, valor, origens, observacao } = req.body;
+
+    // Extrair userId do token
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const movimento = await prisma.pdvCaixaMovimento.create({
+      data: {
+        tipo,
+        valor: parseFloat(valor),
+        userId,
+        userName,
+        observacao: observacao || null,
+        origens: {
+          create: origens.map((o) => ({
+            nome: o.nome,
+            valor: parseFloat(o.valor),
+          })),
+        },
+      },
+      include: { origens: true },
+    });
+
+    res.status(201).json(movimento);
+  } catch (error) {
+    console.error("Erro ao registrar movimentação:", error);
+    res.status(500).json({ error: "Erro ao registrar movimentação", details: error.message });
+  }
+});
+
+// Registrar VALE (sangria / retirada de caixa)
+app.post("/api/pdv-caixa-vale", async (req, res) => {
+  try {
+    const { valor, origens, observacao } = req.body;
+
+    if (!valor || parseFloat(valor) <= 0) {
+      return res.status(400).json({ error: "Valor inválido" });
+    }
+
+    // Extrair userId do token
+    let userId = null;
+    let userName = null;
+    let isAdmin = false;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+        isAdmin = user?.acessos === true;
+      }
+    } catch (e) { /* ignora */ }
+
+    const origensPreenchidas = (origens || []).filter((o) => o.nome && parseFloat(o.valor) > 0);
+
+    // Criar movimento de caixa tipo VALE
+    const movimento = await prisma.pdvCaixaMovimento.create({
+      data: {
+        tipo: "VALE",
+        valor: parseFloat(valor),
+        userId,
+        userName,
+        observacao: observacao || null,
+        origens: origensPreenchidas.length > 0 ? {
+          create: origensPreenchidas.map((o) => ({
+            nome: o.nome,
+            valor: parseFloat(o.valor),
+          })),
+        } : undefined,
+      },
+      include: { origens: true },
+    });
+
+    // Se é admin, criar registro de despesa no módulo PESSOAL
+    let despesaPessoal = null;
+    if (isAdmin) {
+      const descParts = [];
+      if (origensPreenchidas.length > 0) {
+        descParts.push("Destino: " + origensPreenchidas.map(o => `${o.nome} (R$ ${parseFloat(o.valor).toFixed(2)})`).join(", "));
+      }
+      if (observacao) descParts.push(observacao);
+      if (userName) descParts.push(`Realizado por: ${userName}`);
+
+      despesaPessoal = await prisma.despPessoal.create({
+        data: {
+          nomeDespesa: "Vale / Sangria (PDV)",
+          valorDespesa: parseFloat(valor),
+          descDespesa: descParts.join(" | ") || null,
+          date: new Date(),
+          DespesaFixa: false,
+          tipoMovimento: "GASTO",
+          isVale: true,
+        },
+      });
+    }
+
+    res.status(201).json({ movimento, despesaPessoal, isAdmin });
+  } catch (error) {
+    console.error("Erro ao registrar vale:", error);
+    res.status(500).json({ error: "Erro ao registrar vale", details: error.message });
+  }
+});
+
+// Buscar movimentações de caixa
+app.get("/api/pdv-caixa-movimento", async (req, res) => {
+  try {
+    const { tipo, dataInicio, dataFim } = req.query;
+    const where = {};
+    if (tipo) where.tipo = tipo;
+    if (dataInicio || dataFim) {
+      where.createdAt = {};
+      if (dataInicio) where.createdAt.gte = new Date(dataInicio);
+      if (dataFim) {
+        const fim = new Date(dataFim);
+        fim.setHours(23, 59, 59, 999);
+        where.createdAt.lte = fim;
+      }
+    }
+
+    const movimentos = await prisma.pdvCaixaMovimento.findMany({
+      where,
+      include: { origens: true },
+      orderBy: { createdAt: "desc" },
+      take: 100,
+    });
+    res.json(movimentos);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar movimentações", details: error.message });
+  }
+});
+
+// Inicializar origens padrão
+app.post("/api/pdv-origens/init", async (req, res) => {
+  try {
+    const origensDefault = ["Cofre", "Banco", "Pessoal", "Troco Inicial"];
+    const results = [];
+    for (const nome of origensDefault) {
+      const o = await prisma.pdvOrigemConfig.upsert({
+        where: { nome },
+        update: {},
+        create: { nome, ativo: true },
+      });
+      results.push(o);
+    }
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao inicializar origens", details: error.message });
+  }
+});
+
+// ROTAS DE PRÊMIO (caça-níquel)
+app.post("/api/pdv-premio", async (req, res) => {
+  try {
+    const { imagem1, imagem2, valor, origens, observacao } = req.body;
+
+    if (!imagem1 || !imagem2) {
+      return res.status(400).json({ error: "As duas imagens são obrigatórias" });
+    }
+    if (!valor || parseFloat(valor) <= 0) {
+      return res.status(400).json({ error: "Valor inválido" });
+    }
+
+    // Extrair userId do token
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const origensPreenchidas = (origens || []).filter((o) => o.nome && parseFloat(o.valor) > 0);
+
+    const premio = await prisma.pdvPremio.create({
+      data: {
+        imagem1,
+        imagem2,
+        valor: parseFloat(valor),
+        observacao: observacao || null,
+        userId,
+        userName,
+        origens: origensPreenchidas.length > 0 ? {
+          create: origensPreenchidas.map((o) => ({
+            nome: o.nome,
+            valor: parseFloat(o.valor),
+          })),
+        } : undefined,
+      },
+      include: { origens: true },
+    });
+
+    res.status(201).json(premio);
+  } catch (error) {
+    console.error("Erro ao registrar prêmio:", error);
+    res.status(500).json({ error: "Erro ao registrar prêmio", details: error.message });
+  }
+});
+
+app.get("/api/pdv-premio", async (req, res) => {
+  try {
+    const { dataInicio, dataFim } = req.query;
+    const where = {};
+    if (dataInicio || dataFim) {
+      where.createdAt = {};
+      if (dataInicio) where.createdAt.gte = new Date(dataInicio);
+      if (dataFim) {
+        const fim = new Date(dataFim);
+        fim.setHours(23, 59, 59, 999);
+        where.createdAt.lte = fim;
+      }
+    }
+
+    const premios = await prisma.pdvPremio.findMany({
+      where,
+      include: { origens: true },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    // Retorna sem as imagens base64 no listing para performance
+    const premiosResumo = premios.map(p => ({
+      ...p,
+      imagem1: p.imagem1 ? "[imagem]" : null,
+      imagem2: p.imagem2 ? "[imagem]" : null,
+    }));
+    res.json(premiosResumo);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar prêmios", details: error.message });
+  }
+});
+
+// ROTAS CONFIG VENDA — CUPONS
+app.get("/api/pdv-cupons", async (req, res) => {
+  try {
+    const cupons = await prisma.pdvCupom.findMany({ orderBy: { createdAt: "desc" } });
+    res.json(cupons);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar cupons", details: error.message });
+  }
+});
+
+app.post("/api/pdv-cupons", async (req, res) => {
+  try {
+    const { codigo, tipo, valor, descricao, validoAte, limiteUso } = req.body;
+    if (!codigo || !tipo || valor === undefined) {
+      return res.status(400).json({ error: "Código, tipo e valor são obrigatórios" });
+    }
+    const cupom = await prisma.pdvCupom.create({
+      data: {
+        codigo: codigo.toUpperCase().trim(),
+        tipo,
+        valor: parseFloat(valor),
+        descricao: descricao || null,
+        validoAte: validoAte ? new Date(validoAte) : null,
+        limiteUso: limiteUso ? parseInt(limiteUso) : null,
+      },
+    });
+    res.status(201).json(cupom);
+  } catch (error) {
+    if (error.code === "P2002") {
+      return res.status(400).json({ error: "Já existe um cupom com esse código" });
+    }
+    res.status(500).json({ error: "Erro ao criar cupom", details: error.message });
+  }
+});
+
+app.put("/api/pdv-cupons/:id", async (req, res) => {
+  try {
+    const { ativo, codigo, tipo, valor, descricao, validoAte, limiteUso } = req.body;
+    const updateData = {};
+    if (ativo !== undefined) updateData.ativo = ativo;
+    if (codigo !== undefined) updateData.codigo = codigo.toUpperCase().trim();
+    if (tipo !== undefined) updateData.tipo = tipo;
+    if (valor !== undefined) updateData.valor = parseFloat(valor);
+    if (descricao !== undefined) updateData.descricao = descricao;
+    if (validoAte !== undefined) updateData.validoAte = validoAte ? new Date(validoAte) : null;
+    if (limiteUso !== undefined) updateData.limiteUso = limiteUso ? parseInt(limiteUso) : null;
+
+    const cupom = await prisma.pdvCupom.update({
+      where: { id: parseInt(req.params.id) },
+      data: updateData,
+    });
+    res.json(cupom);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao atualizar cupom", details: error.message });
+  }
+});
+
+app.delete("/api/pdv-cupons/:id", async (req, res) => {
+  try {
+    await prisma.pdvCupom.delete({ where: { id: parseInt(req.params.id) } });
+    res.json({ message: "Cupom excluído" });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao excluir cupom", details: error.message });
+  }
+});
+
+// Validar cupom (para uso na venda)
+app.post("/api/pdv-cupons/validar", async (req, res) => {
+  try {
+    const { codigo } = req.body;
+    const cupom = await prisma.pdvCupom.findUnique({ where: { codigo: codigo.toUpperCase().trim() } });
+    if (!cupom) return res.status(404).json({ error: "Cupom não encontrado" });
+    if (!cupom.ativo) return res.status(400).json({ error: "Cupom desativado" });
+    if (cupom.validoAte && new Date() > new Date(cupom.validoAte)) {
+      return res.status(400).json({ error: "Cupom expirado" });
+    }
+    if (cupom.limiteUso && cupom.vezesUsado >= cupom.limiteUso) {
+      return res.status(400).json({ error: "Cupom atingiu o limite de uso" });
+    }
+    res.json(cupom);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao validar cupom", details: error.message });
+  }
+});
+
+// ROTAS CONFIG VENDA — TAXAS DE MÁQUINA
+app.get("/api/pdv-taxas", async (req, res) => {
+  try {
+    const taxas = await prisma.pdvTaxaMaquina.findMany({ orderBy: { createdAt: "desc" } });
+    res.json(taxas);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar taxas", details: error.message });
+  }
+});
+
+app.post("/api/pdv-taxas", async (req, res) => {
+  try {
+    const { nome, tipo, valor } = req.body;
+    if (!nome || !tipo || valor === undefined) {
+      return res.status(400).json({ error: "Nome, tipo e valor são obrigatórios" });
+    }
+    const taxa = await prisma.pdvTaxaMaquina.create({
+      data: { nome, tipo, valor: parseFloat(valor) },
+    });
+    res.status(201).json(taxa);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao criar taxa", details: error.message });
+  }
+});
+
+app.put("/api/pdv-taxas/:id", async (req, res) => {
+  try {
+    const { nome, tipo, valor, ativo } = req.body;
+    const updateData = {};
+    if (nome !== undefined) updateData.nome = nome;
+    if (tipo !== undefined) updateData.tipo = tipo;
+    if (valor !== undefined) updateData.valor = parseFloat(valor);
+    if (ativo !== undefined) updateData.ativo = ativo;
+    const taxa = await prisma.pdvTaxaMaquina.update({
+      where: { id: parseInt(req.params.id) },
+      data: updateData,
+    });
+    res.json(taxa);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao atualizar taxa", details: error.message });
+  }
+});
+
+app.delete("/api/pdv-taxas/:id", async (req, res) => {
+  try {
+    await prisma.pdvTaxaMaquina.delete({ where: { id: parseInt(req.params.id) } });
+    res.json({ message: "Taxa excluída" });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao excluir taxa", details: error.message });
+  }
+});
+
+// ROTAS CONFIG VENDA — CONFIGURAÇÕES GERAIS (limites, etc)
+app.get("/api/pdv-config", async (req, res) => {
+  try {
+    const configs = await prisma.pdvConfigVenda.findMany({ orderBy: { chave: "asc" } });
+    res.json(configs);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar configurações", details: error.message });
+  }
+});
+
+app.put("/api/pdv-config/:chave", async (req, res) => {
+  try {
+    const { valor } = req.body;
+    const config = await prisma.pdvConfigVenda.upsert({
+      where: { chave: req.params.chave },
+      update: { valor: String(valor) },
+      create: { chave: req.params.chave, valor: String(valor), descricao: req.body.descricao || null },
+    });
+    res.json(config);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao salvar configuração", details: error.message });
+  }
+});
+
+app.post("/api/pdv-config/init", async (req, res) => {
+  try {
+    const defaults = [
+      { chave: "limite_comanda", valor: "500", descricao: "Valor máximo permitido por comanda aberta (R$)" },
+      { chave: "max_comandas_abertas", valor: "10", descricao: "Número máximo de comandas abertas simultaneamente" },
+      { chave: "dias_vencimento_comanda", valor: "30", descricao: "Dias até uma comanda ser considerada vencida" },
+    ];
+    const results = [];
+    for (const d of defaults) {
+      const c = await prisma.pdvConfigVenda.upsert({
+        where: { chave: d.chave },
+        update: {},
+        create: d,
+      });
+      results.push(c);
+    }
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao inicializar configurações", details: error.message });
+  }
+});
+
+// Buscar comandas pendentes (clientes com débito > 0)
+app.get("/api/pdv-comandas-pendentes", async (req, res) => {
+  try {
+    const clientes = await prisma.client.findMany({
+      where: { totalDebt: { gt: 0 } },
+      include: {
+        Purchase: { orderBy: { createdAt: "desc" }, take: 5 },
+        Payment: { orderBy: { createdAt: "desc" }, take: 5 },
+      },
+      orderBy: { totalDebt: "desc" },
+    });
+    res.json(clientes);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar comandas pendentes", details: error.message });
   }
 });
 
