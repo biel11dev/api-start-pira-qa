@@ -45,6 +45,98 @@ const authenticate = (req, res, next) => {
   }
 };
 
+// Mapeamento de rotas para módulos (para auditoria)
+const rotaParaModulo = (rota) => {
+  if (rota.includes("/api/balance")) return "caixa";
+  if (rota.includes("/api/sales")) return "pdv";
+  if (rota.includes("/api/estoque")) return "pdv";
+  if (rota.includes("/api/products")) return "produtos";
+  if (rota.includes("/api/categories")) return "estoque";
+  if (rota.includes("/api/unit-equivalences")) return "estoque";
+  if (rota.includes("/api/stock-movements")) return "estoque";
+  if (rota.includes("/api/machines")) return "maquinas";
+  if (rota.includes("/api/machine-week")) return "maquinas";
+  if (rota.includes("/api/daily-readings")) return "maquinas";
+  if (rota.includes("/api/clients")) return "fiado";
+  if (rota.includes("/api/purchases")) return "fiado";
+  if (rota.includes("/api/payments")) return "fiado";
+  if (rota.includes("/api/despesas") || rota.includes("/api/cadastrodesp")) return "despesas";
+  if (rota.includes("/api/desp-pessoal") || rota.includes("/api/cat-desp-pessoal")) return "pessoal";
+  if (rota.includes("/api/employees") || rota.includes("/api/daily-points") || rota.includes("/api/weekly-meta")) return "ponto";
+  if (rota.includes("/api/users")) return "acessos";
+  if (rota.includes("/api/register")) return "acessos";
+  if (rota.includes("/api/login")) return "autenticacao";
+  return "outro";
+};
+
+// Middleware de auditoria - registra ações no banco
+const auditoriaMiddleware = async (req, res, next) => {
+  // Ignora rotas de auditoria para evitar loop
+  if (req.path.includes("/api/auditoria")) return next();
+  // Ignora rotas estáticas e de validação de token
+  if (!req.path.startsWith("/api/")) return next();
+  if (req.path === "/api/validate-token") return next();
+
+  // Captura a resposta original
+  const originalJson = res.json.bind(res);
+  res.json = async (body) => {
+    try {
+      const modulo = rotaParaModulo(req.path);
+      const acao = req.method;
+
+      // Verifica se o módulo está configurado para auditoria
+      const config = await prisma.auditoriaConfig.findUnique({ where: { modulo } });
+      if (config && !config.ativo) {
+        return originalJson(body);
+      }
+
+      // Tenta obter dados do usuário
+      let userId = req.userId || null;
+      let userName = null;
+      if (userId) {
+        try {
+          const user = await prisma.user.findUnique({ where: { id: userId } });
+          userName = user?.name || user?.username || null;
+        } catch (e) { /* ignora */ }
+      }
+      // Para login, captura do body da resposta
+      if (req.path === "/api/login" && body?.username) {
+        userName = body.name || body.username;
+      }
+
+      // Resumo do payload (limita tamanho)
+      let payload = null;
+      if (req.body && Object.keys(req.body).length > 0) {
+        const bodyClone = { ...req.body };
+        delete bodyClone.password; // Remove senha por segurança
+        payload = JSON.stringify(bodyClone).substring(0, 1000);
+      }
+
+      const descricao = `${acao} ${req.path}` + (res.statusCode >= 400 ? ` [ERRO ${res.statusCode}]` : "");
+
+      await prisma.auditoria.create({
+        data: {
+          modulo,
+          acao,
+          descricao,
+          rota: req.originalUrl || req.path,
+          userId,
+          userName,
+          ip: req.ip || req.connection?.remoteAddress || null,
+          payload,
+        },
+      });
+    } catch (err) {
+      console.error("Erro ao registrar auditoria:", err.message);
+    }
+    return originalJson(body);
+  };
+  next();
+};
+
+// Aplica middleware de auditoria globalmente
+app.use(auditoriaMiddleware);
+
 async function sendResetEmail(email, token) {
   const transporter = nodemailer.createTransport({
     host: "smtp.gmail.com",
@@ -130,6 +222,7 @@ app.post("/api/login", async (req, res) => {
       base_produto: user.base_produto,
       pdv: user.pdv,
       pessoal: user.pessoal,
+      auditoria: user.auditoria,
     },
   });
 });
@@ -137,9 +230,9 @@ app.post("/api/login", async (req, res) => {
 app.put("/api/users/:id", async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
-    const { name, caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv } = req.body;
+    const { name, caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv, pessoal, auditoria } = req.body;
 
-    const updateData = { caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv };
+    const updateData = { caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv, pessoal, auditoria };
     if (name !== undefined) updateData.name = name;
 
     const updatedUser = await prisma.user.update({
@@ -679,6 +772,142 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
   }
 });
 
+// Converter Unidades → Unidade empacotada (reverso)
+app.post("/api/estoque_prod/converter-reverso", async (req, res) => {
+  try {
+    const { estoqueId, targetUnit, quantityPacked } = req.body;
+
+    if (!estoqueId || !targetUnit || !quantityPacked) {
+      return res.status(400).json({ error: "estoqueId, targetUnit e quantityPacked são obrigatórios." });
+    }
+
+    const parsedQty = parseInt(quantityPacked, 10);
+    if (isNaN(parsedQty) || parsedQty <= 0) {
+      return res.status(400).json({ error: "Quantidade deve ser um número válido maior que zero." });
+    }
+
+    // Buscar o item de Unidade no estoque
+    const estoqueItem = await prisma.estoque.findUnique({
+      where: { id: parseInt(estoqueId) },
+      include: { product: true }
+    });
+    if (!estoqueItem) {
+      return res.status(404).json({ error: "Item não encontrado no estoque." });
+    }
+
+    if (estoqueItem.unit !== "Unidade") {
+      return res.status(400).json({ error: "Este item não está em Unidades. Use a conversão normal." });
+    }
+
+    // Buscar fator de conversão da unidade de destino
+    const equivalence = await prisma.unitEquivalence.findUnique({
+      where: { unitName: targetUnit }
+    });
+    if (!equivalence) {
+      return res.status(400).json({
+        error: `Equivalência não definida para "${targetUnit}". Cadastre a equivalência primeiro.`
+      });
+    }
+
+    const unitsNeeded = parsedQty * equivalence.value;
+
+    if (estoqueItem.quantity < unitsNeeded) {
+      return res.status(400).json({
+        error: `Unidades insuficientes. Necessário: ${unitsNeeded} un. Disponível: ${estoqueItem.quantity} un.`
+      });
+    }
+
+    const packedValueSell = estoqueItem.value * equivalence.value;
+    const packedValueCost = estoqueItem.valuecusto * equivalence.value;
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Diminuir unidades do item original
+      const previousStock = estoqueItem.quantity;
+      const newStock = previousStock - unitsNeeded;
+
+      await tx.estoque.update({
+        where: { id: estoqueItem.id },
+        data: { quantity: newStock }
+      });
+
+      await tx.stockMovement.create({
+        data: {
+          estoqueId: estoqueItem.id,
+          type: 'CONVERSION_OUT',
+          quantity: -unitsNeeded,
+          previousStock: previousStock,
+          newStock: newStock,
+          description: `Conversão reversa: ${unitsNeeded}x Unidade → ${parsedQty}x ${targetUnit}`,
+          referenceType: 'Conversion'
+        }
+      });
+
+      // 2. Verificar se já existe registro nessa unidade para este produto
+      const existingPackedStock = await tx.estoque.findFirst({
+        where: { productId: estoqueItem.productId, unit: targetUnit }
+      });
+
+      let packedEstoqueItem;
+      if (existingPackedStock) {
+        const prevPackedStock = existingPackedStock.quantity;
+        const newPackedStock = prevPackedStock + parsedQty;
+
+        packedEstoqueItem = await tx.estoque.update({
+          where: { id: existingPackedStock.id },
+          data: { quantity: newPackedStock }
+        });
+
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: existingPackedStock.id,
+            type: 'CONVERSION_IN',
+            quantity: parsedQty,
+            previousStock: prevPackedStock,
+            newStock: newPackedStock,
+            description: `Conversão reversa: ${unitsNeeded}x Unidade → ${parsedQty}x ${targetUnit}`,
+            referenceType: 'Conversion'
+          }
+        });
+      } else {
+        packedEstoqueItem = await tx.estoque.create({
+          data: {
+            productId: estoqueItem.productId,
+            name: estoqueItem.name,
+            quantity: parsedQty,
+            unit: targetUnit,
+            value: Math.round(packedValueSell * 100) / 100,
+            valuecusto: Math.round(packedValueCost * 100) / 100,
+            categoria_Id: estoqueItem.categoria_Id
+          }
+        });
+
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: packedEstoqueItem.id,
+            type: 'CONVERSION_IN',
+            quantity: parsedQty,
+            previousStock: 0,
+            newStock: parsedQty,
+            description: `Conversão reversa: ${unitsNeeded}x Unidade → ${parsedQty}x ${targetUnit} (novo registro)`,
+            referenceType: 'Conversion'
+          }
+        });
+      }
+
+      return {
+        origin: { id: estoqueItem.id, name: estoqueItem.name, unit: "Unidade", removed: unitsNeeded, remaining: newStock },
+        destination: { id: packedEstoqueItem.id, name: estoqueItem.name, unit: targetUnit, added: parsedQty, total: packedEstoqueItem.quantity },
+        conversionFactor: equivalence.value
+      };
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error("Erro na conversão reversa:", error);
+    res.status(500).json({ error: "Erro ao converter unidade", details: error.message });
+  }
+});
+
 app.post("/api/estoque_prod", async (req, res) => {
   try {
     const { name, quantity, unit, value, valuecusto, categoryId, productId } = req.body;
@@ -784,12 +1013,40 @@ app.delete("/api/estoque_prod/:id", async (req, res) => {
       return res.status(400).json({ error: "ID inválido" });
     }
 
-    await prisma.estoque.delete({ where: { id } });
+    // Excluir registros relacionados antes de excluir o item do estoque
+    await prisma.$transaction([
+      prisma.stockMovement.deleteMany({ where: { estoqueId: id } }),
+      prisma.saleItem.deleteMany({ where: { estoqueId: id } }),
+      prisma.estoque.delete({ where: { id } }),
+    ]);
+
     res.json({ message: "Produto excluído com sucesso" });
   } catch (error) {
     res.status(500).json({ error: "Erro ao excluir produto", details: error.message });
   }
 });
+
+// Rota para verificar senha do usuário (confirmação de ações sensíveis)
+app.post("/api/verify-password", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: "Usuário e senha são obrigatórios" });
+    }
+    const user = await prisma.user.findUnique({ where: { username } });
+    if (!user) {
+      return res.status(401).json({ error: "Usuário não encontrado" });
+    }
+    const isValid = await bcrypt.compare(password, user.password);
+    if (!isValid) {
+      return res.status(401).json({ error: "Senha incorreta" });
+    }
+    res.json({ verified: true });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao verificar senha", details: error.message });
+  }
+});
+
 // ROTAS DE PRODUTOS (CORREÇÃO DO ERRO `quantity`)
 app.get("/api/products", async (req, res) => {
   try {
@@ -2780,6 +3037,154 @@ app.post("/api/migrate-employee-meta-history", async (req, res) => {
   }
 });
 
+// ROTAS DE AUDITORIA
+app.get("/api/auditoria", async (req, res) => {
+  try {
+    const { modulo, acao, userId, userName, dataInicio, dataFim, page = 1, limit = 50 } = req.query;
+    const where = {};
+
+    if (modulo) where.modulo = modulo;
+    if (acao) where.acao = acao;
+    if (userId) where.userId = parseInt(userId);
+    if (userName) where.userName = { contains: userName, mode: "insensitive" };
+    if (dataInicio || dataFim) {
+      where.createdAt = {};
+      if (dataInicio) where.createdAt.gte = new Date(dataInicio);
+      if (dataFim) {
+        const fim = new Date(dataFim);
+        fim.setHours(23, 59, 59, 999);
+        where.createdAt.lte = fim;
+      }
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [registros, total] = await Promise.all([
+      prisma.auditoria.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take: parseInt(limit),
+      }),
+      prisma.auditoria.count({ where }),
+    ]);
+
+    res.json({
+      registros,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar auditoria", details: error.message });
+  }
+});
+
+// Retorna lista de módulos distintos para filtro
+app.get("/api/auditoria/modulos", async (req, res) => {
+  try {
+    const modulos = await prisma.auditoria.findMany({
+      select: { modulo: true },
+      distinct: ["modulo"],
+      orderBy: { modulo: "asc" },
+    });
+    res.json(modulos.map((m) => m.modulo));
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar módulos", details: error.message });
+  }
+});
+
+// Retorna lista de usuários distintos para filtro
+app.get("/api/auditoria/usuarios", async (req, res) => {
+  try {
+    const usuarios = await prisma.auditoria.findMany({
+      select: { userId: true, userName: true },
+      distinct: ["userId"],
+      where: { userId: { not: null } },
+      orderBy: { userName: "asc" },
+    });
+    res.json(usuarios);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar usuários da auditoria", details: error.message });
+  }
+});
+
+// Estatísticas de auditoria
+app.get("/api/auditoria/stats", async (req, res) => {
+  try {
+    const { dataInicio, dataFim } = req.query;
+    const where = {};
+    if (dataInicio || dataFim) {
+      where.createdAt = {};
+      if (dataInicio) where.createdAt.gte = new Date(dataInicio);
+      if (dataFim) {
+        const fim = new Date(dataFim);
+        fim.setHours(23, 59, 59, 999);
+        where.createdAt.lte = fim;
+      }
+    }
+
+    const [totalRegistros, porModulo, porAcao, porUsuario] = await Promise.all([
+      prisma.auditoria.count({ where }),
+      prisma.auditoria.groupBy({ by: ["modulo"], _count: { id: true }, where, orderBy: { _count: { id: "desc" } } }),
+      prisma.auditoria.groupBy({ by: ["acao"], _count: { id: true }, where, orderBy: { _count: { id: "desc" } } }),
+      prisma.auditoria.groupBy({ by: ["userName"], _count: { id: true }, where: { ...where, userName: { not: null } }, orderBy: { _count: { id: "desc" } }, take: 10 }),
+    ]);
+
+    res.json({
+      totalRegistros,
+      porModulo: porModulo.map((m) => ({ modulo: m.modulo, count: m._count.id })),
+      porAcao: porAcao.map((a) => ({ acao: a.acao, count: a._count.id })),
+      porUsuario: porUsuario.map((u) => ({ userName: u.userName, count: u._count.id })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar estatísticas", details: error.message });
+  }
+});
+
+// ROTAS DE CONFIGURAÇÃO DE AUDITORIA
+app.get("/api/auditoria-config", async (req, res) => {
+  try {
+    const configs = await prisma.auditoriaConfig.findMany({ orderBy: { modulo: "asc" } });
+    res.json(configs);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar configurações de auditoria", details: error.message });
+  }
+});
+
+app.put("/api/auditoria-config/:modulo", async (req, res) => {
+  try {
+    const { modulo } = req.params;
+    const { ativo } = req.body;
+    const config = await prisma.auditoriaConfig.upsert({
+      where: { modulo },
+      update: { ativo },
+      create: { modulo, ativo },
+    });
+    res.json(config);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao atualizar configuração de auditoria", details: error.message });
+  }
+});
+
+// Inicializa configurações de auditoria padrão
+app.post("/api/auditoria-config/init", async (req, res) => {
+  try {
+    const modulos = ["caixa", "pdv", "produtos", "estoque", "maquinas", "fiado", "despesas", "pessoal", "ponto", "acessos", "autenticacao", "outro"];
+    const results = [];
+    for (const modulo of modulos) {
+      const config = await prisma.auditoriaConfig.upsert({
+        where: { modulo },
+        update: {},
+        create: { modulo, ativo: true },
+      });
+      results.push(config);
+    }
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao inicializar configurações", details: error.message });
+  }
+});
+
 // ROTA DE TESTE
 // Middleware para servir os arquivos estáticos do React
 app.use(express.static(path.join(__dirname, "dist")));
@@ -2794,6 +3199,26 @@ app.use((err, req, res, next) => {
   console.error("Erro:", err);
   res.status(500).json({ error: "Erro interno do servidor", details: err.message });
 });
+
+// Limpeza automática de auditoria (mantém apenas 30 dias)
+const limparAuditoriaAntiga = async () => {
+  try {
+    const dataLimite = new Date();
+    dataLimite.setDate(dataLimite.getDate() - 30);
+    const resultado = await prisma.auditoria.deleteMany({
+      where: { createdAt: { lt: dataLimite } },
+    });
+    if (resultado.count > 0) {
+      console.log(`[Auditoria] ${resultado.count} registros com mais de 30 dias removidos.`);
+    }
+  } catch (err) {
+    console.error("[Auditoria] Erro ao limpar registros antigos:", err.message);
+  }
+};
+
+// Executa limpeza ao iniciar o servidor e depois a cada 24h
+limparAuditoriaAntiga();
+setInterval(limparAuditoriaAntiga, 24 * 60 * 60 * 1000);
 
 app.listen(port, () => {
   console.log(`Server tá on krai --> http://localhost:${port}`);
