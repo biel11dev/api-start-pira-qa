@@ -2207,14 +2207,17 @@ app.post('/api/sales', async (req, res) => {
           ? parseFloat((splitPay.find(s => s.forma === "pendente") || {}).valor || 0)
           : saleTotal;
 
+        // Formatar data como string (Purchase.date é String no schema)
+        const purchaseDateStr = format(parseISO(date), "yyyy-MM-dd");
+
         // Criar Purchase (fiado) para cada item
         for (const item of items) {
           await tx.purchase.create({
             data: {
               product: item.name,
-              quantity: item.quantity,
+              quantity: parseInt(item.quantity, 10),
               total: item.price * item.quantity,
-              date: parseISO(date),
+              date: purchaseDateStr,
               clientId: pendente.clientId,
             }
           });
