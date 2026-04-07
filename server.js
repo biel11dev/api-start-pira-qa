@@ -2120,7 +2120,7 @@ app.post('/api/sales', async (req, res) => {
       }
     }
 
-    // Verificar limite de comanda se pendente
+    // Verificar limite de comanda se pendente (usa soma de comandas abertas, não totalDebt)
     if (pendente && pendente.clientId) {
       const client = await prisma.client.findUnique({ where: { id: pendente.clientId } });
       if (!client) return res.status(400).json({ error: "Cliente não encontrado." });
@@ -2128,8 +2128,14 @@ app.post('/api/sales', async (req, res) => {
       if (limiteConfig) {
         const limite = parseFloat(limiteConfig.valor);
         const valorPendente = parseFloat(finalTotal || total);
-        if ((client.totalDebt + valorPendente) > limite) {
-          return res.status(400).json({ error: `Limite de comanda excedido! Débito atual: R$ ${client.totalDebt.toFixed(2)}, Limite: R$ ${limite.toFixed(2)}` });
+        // Somar comandas abertas do cliente
+        const comandasAbertas = await prisma.pdvComanda.aggregate({
+          where: { clientId: pendente.clientId, status: "ABERTA" },
+          _sum: { total: true },
+        });
+        const totalAberto = (comandasAbertas._sum.total || 0) + valorPendente;
+        if (totalAberto > limite) {
+          return res.status(400).json({ error: `Limite de comanda excedido! Total em aberto: R$ ${(comandasAbertas._sum.total || 0).toFixed(2)} + R$ ${valorPendente.toFixed(2)} = R$ ${totalAberto.toFixed(2)}, Limite: R$ ${limite.toFixed(2)}` });
         }
       }
     }
@@ -2201,32 +2207,26 @@ app.post('/api/sales', async (req, res) => {
         });
       }
 
-      // 3. Se pendente, criar registros de fiado (Purchase) e atualizar dívida do cliente
+      // 3. Se pendente, criar COMANDA (NÃO fiado imediatamente) - fiado só após 24h sem pagamento
       if (pendente && pendente.clientId) {
-        const valorPendente = splitPay
-          ? parseFloat((splitPay.find(s => s.forma === "pendente") || {}).valor || 0)
-          : saleTotal;
-
-        // Formatar data como string (Purchase.date é String no schema)
-        const purchaseDateStr = format(parseISO(date), "yyyy-MM-dd");
-
-        // Criar Purchase (fiado) para cada item
-        for (const item of items) {
-          await tx.purchase.create({
-            data: {
-              product: item.name,
-              quantity: parseInt(item.quantity, 10),
-              total: item.price * item.quantity,
-              date: purchaseDateStr,
-              clientId: pendente.clientId,
+        await tx.pdvComanda.create({
+          data: {
+            clientId: pendente.clientId,
+            saleId: sale.id,
+            total: splitPay
+              ? parseFloat((splitPay.find(s => s.forma === "pendente") || {}).valor || 0)
+              : saleTotal,
+            status: "ABERTA",
+            items: {
+              create: items.map(item => ({
+                productName: item.name,
+                quantity: item.quantity,
+                unitPrice: item.price,
+                total: item.price * item.quantity,
+                estoqueId: item.id,
+              }))
             }
-          });
-        }
-
-        // Atualizar totalDebt do cliente
-        await tx.client.update({
-          where: { id: pendente.clientId },
-          data: { totalDebt: { increment: valorPendente } }
+          }
         });
       }
 
@@ -3683,18 +3683,205 @@ app.post("/api/pdv-formas-pagamento/init", async (req, res) => {
   }
 });
 
-// Buscar comandas pendentes (clientes com débito > 0)
+// ========== ROTAS DE COMANDAS PDV ==========
+
+// Converter comandas com 24h+ sem pagamento para fiado
+const converterComandasExpiradas = async () => {
+  try {
+    const limite24h = new Date();
+    limite24h.setHours(limite24h.getHours() - 24);
+
+    const expiradas = await prisma.pdvComanda.findMany({
+      where: { status: "ABERTA", createdAt: { lt: limite24h } },
+      include: { items: true, client: true },
+    });
+
+    for (const comanda of expiradas) {
+      await prisma.$transaction(async (tx) => {
+        // Criar Purchase (fiado) para cada item da comanda
+        for (const item of comanda.items) {
+          await tx.purchase.create({
+            data: {
+              product: item.productName,
+              quantity: item.quantity,
+              total: item.total,
+              date: comanda.createdAt.toISOString(),
+              clientId: comanda.clientId,
+            }
+          });
+        }
+        // Atualizar totalDebt do cliente
+        await tx.client.update({
+          where: { id: comanda.clientId },
+          data: { totalDebt: { increment: comanda.total } }
+        });
+        // Marcar comanda como FIADO
+        await tx.pdvComanda.update({
+          where: { id: comanda.id },
+          data: { status: "FIADO" }
+        });
+      });
+    }
+
+    return expiradas.length;
+  } catch (error) {
+    console.error("Erro ao converter comandas expiradas:", error);
+    return 0;
+  }
+};
+
+// Buscar todas as comandas abertas (verifica expiradas antes)
+app.get("/api/pdv-comandas", async (req, res) => {
+  try {
+    // Primeiro converte as expiradas
+    await converterComandasExpiradas();
+
+    const { status } = req.query;
+    const where = {};
+    if (status) {
+      where.status = status;
+    } else {
+      where.status = "ABERTA";
+    }
+
+    const comandas = await prisma.pdvComanda.findMany({
+      where,
+      include: {
+        client: true,
+        items: true,
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(comandas);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar comandas", details: error.message });
+  }
+});
+
+// Buscar comanda específica
+app.get("/api/pdv-comandas/:id", async (req, res) => {
+  try {
+    const comanda = await prisma.pdvComanda.findUnique({
+      where: { id: parseInt(req.params.id) },
+      include: { client: true, items: true },
+    });
+    if (!comanda) return res.status(404).json({ error: "Comanda não encontrada" });
+    res.json(comanda);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar comanda", details: error.message });
+  }
+});
+
+// Adicionar itens a uma comanda existente
+app.post("/api/pdv-comandas/:id/items", async (req, res) => {
+  try {
+    const { items } = req.body;
+    const comanda = await prisma.pdvComanda.findUnique({ where: { id: parseInt(req.params.id) } });
+    if (!comanda) return res.status(404).json({ error: "Comanda não encontrada" });
+    if (comanda.status !== "ABERTA") return res.status(400).json({ error: "Comanda já foi fechada" });
+
+    const totalAdicionado = items.reduce((s, i) => s + (i.price * i.quantity), 0);
+
+    const updated = await prisma.$transaction(async (tx) => {
+      // Adicionar itens
+      for (const item of items) {
+        await tx.pdvComandaItem.create({
+          data: {
+            comandaId: comanda.id,
+            productName: item.name,
+            quantity: item.quantity,
+            unitPrice: item.price,
+            total: item.price * item.quantity,
+            estoqueId: item.id || null,
+          }
+        });
+        // Dar baixa no estoque
+        if (item.id) {
+          const estoqueItem = await tx.estoque.findUnique({ where: { id: item.id } });
+          if (estoqueItem && estoqueItem.quantity >= item.quantity) {
+            const prev = estoqueItem.quantity;
+            const novo = prev - item.quantity;
+            await tx.estoque.update({ where: { id: item.id }, data: { quantity: novo } });
+            await tx.stockMovement.create({
+              data: {
+                estoqueId: item.id, type: 'SALE', quantity: -item.quantity,
+                previousStock: prev, newStock: novo,
+                description: `Comanda #${comanda.id} - ${item.name} (${item.quantity}x)`,
+                referenceType: 'Comanda'
+              }
+            });
+          }
+        }
+      }
+      // Atualizar total da comanda
+      return tx.pdvComanda.update({
+        where: { id: comanda.id },
+        data: { total: { increment: totalAdicionado } },
+        include: { client: true, items: true },
+      });
+    });
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao adicionar itens", details: error.message });
+  }
+});
+
+// Fechar/Pagar comanda
+app.put("/api/pdv-comandas/:id/fechar", async (req, res) => {
+  try {
+    const { paymentMethod } = req.body;
+    const comanda = await prisma.pdvComanda.findUnique({
+      where: { id: parseInt(req.params.id) },
+      include: { items: true, client: true },
+    });
+    if (!comanda) return res.status(404).json({ error: "Comanda não encontrada" });
+    if (comanda.status !== "ABERTA") return res.status(400).json({ error: "Comanda já foi fechada" });
+
+    const updated = await prisma.pdvComanda.update({
+      where: { id: comanda.id },
+      data: {
+        status: "PAGA",
+        paymentMethod: paymentMethod || "dinheiro",
+        paidAt: new Date(),
+      },
+      include: { client: true, items: true },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao fechar comanda", details: error.message });
+  }
+});
+
+// Buscar comandas abertas agrupadas por cliente (para o painel de config)
 app.get("/api/pdv-comandas-pendentes", async (req, res) => {
   try {
-    const clientes = await prisma.client.findMany({
-      where: { totalDebt: { gt: 0 } },
-      include: {
-        Purchase: { orderBy: { createdAt: "desc" }, take: 5 },
-        Payment: { orderBy: { createdAt: "desc" }, take: 5 },
-      },
-      orderBy: { totalDebt: "desc" },
+    await converterComandasExpiradas();
+
+    const comandas = await prisma.pdvComanda.findMany({
+      where: { status: "ABERTA" },
+      include: { client: true, items: true },
+      orderBy: { createdAt: "desc" },
     });
-    res.json(clientes);
+
+    // Agrupar por cliente
+    const clientMap = {};
+    for (const c of comandas) {
+      if (!clientMap[c.clientId]) {
+        clientMap[c.clientId] = {
+          id: c.clientId,
+          name: c.client.name,
+          totalDebt: c.client.totalDebt,
+          comandas: [],
+          totalComandas: 0,
+        };
+      }
+      clientMap[c.clientId].comandas.push(c);
+      clientMap[c.clientId].totalComandas += c.total;
+    }
+
+    res.json(Object.values(clientMap));
   } catch (error) {
     res.status(500).json({ error: "Erro ao buscar comandas pendentes", details: error.message });
   }
@@ -3882,6 +4069,10 @@ const limparAuditoriaAntiga = async () => {
 // Executa limpeza ao iniciar o servidor e depois a cada 24h
 limparAuditoriaAntiga();
 setInterval(limparAuditoriaAntiga, 24 * 60 * 60 * 1000);
+
+// Verifica comandas expiradas ao iniciar e a cada 1h
+converterComandasExpiradas().then(n => { if (n > 0) console.log(`[Comandas] ${n} comandas convertidas para fiado.`); });
+setInterval(() => converterComandasExpiradas(), 60 * 60 * 1000);
 
 app.listen(port, () => {
   console.log(`Server tá on krai --> http://localhost:${port}`);

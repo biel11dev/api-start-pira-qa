@@ -29,6 +29,7 @@ model Client {
   updatedAt DateTime @updatedAt
   Payment   Payment[]
   Purchase  Purchase[]
+  Comanda   PdvComanda[]
 }
 
 model DailyReading {
@@ -424,4 +425,36 @@ model PdvFormaPagamento {
   ativo     Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model PdvComanda {
+  id            Int               @id @default(autoincrement())
+  clientId      Int
+  client        Client            @relation(fields: [clientId], references: [id])
+  saleId        Int?              // Venda que originou a comanda
+  total         Float
+  status        String            @default("ABERTA") // "ABERTA", "PAGA", "FIADO"
+  paymentMethod String?           // Preenchido quando paga
+  items         PdvComandaItem[]
+  createdAt     DateTime          @default(now())
+  paidAt        DateTime?
+  updatedAt     DateTime          @updatedAt
+
+  @@index([clientId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model PdvComandaItem {
+  id          Int        @id @default(autoincrement())
+  comandaId   Int
+  comanda     PdvComanda @relation(fields: [comandaId], references: [id], onDelete: Cascade)
+  productName String
+  quantity    Float
+  unitPrice   Float
+  total       Float
+  estoqueId   Int?
+  createdAt   DateTime   @default(now())
+
+  @@index([comandaId])
 }
