@@ -3868,11 +3868,12 @@ app.get("/api/pdv-comandas-pendentes", async (req, res) => {
     // Agrupar por cliente
     const clientMap = {};
     for (const c of comandas) {
+      if (!c.client) continue; // Pular comandas sem cliente válido
       if (!clientMap[c.clientId]) {
         clientMap[c.clientId] = {
           id: c.clientId,
-          name: c.client.name,
-          totalDebt: c.client.totalDebt,
+          name: c.client.name || "Cliente sem nome",
+          totalDebt: c.client.totalDebt || 0,
           comandas: [],
           totalComandas: 0,
         };
