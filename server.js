@@ -1061,6 +1061,28 @@ app.post("/api/verify-password", async (req, res) => {
   }
 });
 
+// Rota para verificar senha do Vale (usa JWT token para identificar o usuário)
+app.post("/api/verify-vale-password", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: "Token não fornecido" });
+    const token = authHeader.split(" ")[1];
+    const decoded = jwt.verify(token, SECRET_KEY);
+    const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: "Senha é obrigatória" });
+    const isValid = await bcrypt.compare(password, user.password);
+    if (!isValid) return res.status(401).json({ error: "Senha incorreta" });
+    res.json({ verified: true });
+  } catch (error) {
+    if (error.name === "JsonWebTokenError" || error.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Token inválido ou expirado" });
+    }
+    res.status(500).json({ error: "Erro ao verificar senha", details: error.message });
+  }
+});
+
 // ROTAS DE PRODUTOS (CORREÇÃO DO ERRO `quantity`)
 app.get("/api/products", async (req, res) => {
   try {
@@ -2083,7 +2105,7 @@ app.delete("/api/categories/:id", async (req, res) => {
 // Rota para criar uma nova venda (PDV) com baixa de estoque
 app.post('/api/sales', async (req, res) => {
   try {
-    const { items, total, paymentMethod, customerName, amountReceived, change, date } = req.body;
+    const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal } = req.body;
 
     // Verificar estoque antes de prosseguir (busca na tabela Estoque)
     for (const item of items) {
@@ -2098,15 +2120,43 @@ app.post('/api/sales', async (req, res) => {
       }
     }
 
+    // Verificar limite de comanda se pendente
+    if (pendente && pendente.clientId) {
+      const client = await prisma.client.findUnique({ where: { id: pendente.clientId } });
+      if (!client) return res.status(400).json({ error: "Cliente não encontrado." });
+      const limiteConfig = await prisma.pdvConfigVenda.findFirst({ where: { chave: "limite_comanda" } });
+      if (limiteConfig) {
+        const limite = parseFloat(limiteConfig.valor);
+        const valorPendente = parseFloat(finalTotal || total);
+        if ((client.totalDebt + valorPendente) > limite) {
+          return res.status(400).json({ error: `Limite de comanda excedido! Débito atual: R$ ${client.totalDebt.toFixed(2)}, Limite: R$ ${limite.toFixed(2)}` });
+        }
+      }
+    }
+
+    // Verificar senha do Vale se necessário
+    if (vale && vale.password) {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) return res.status(401).json({ error: "Token não fornecido para verificação do Vale." });
+      const token = authHeader.split(" ")[1];
+      const decoded = jwt.verify(token, SECRET_KEY);
+      const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
+      if (!user) return res.status(401).json({ error: "Usuário do Vale não encontrado." });
+      const isValid = await bcrypt.compare(vale.password, user.password);
+      if (!isValid) return res.status(401).json({ error: "Senha do Vale incorreta." });
+    }
+
+    const saleTotal = parseFloat(finalTotal || total);
+
     // Usar transação para garantir consistência entre venda, estoque e movimentação
     const result = await prisma.$transaction(async (tx) => {
       // 1. Criar a venda
       const sale = await tx.sale.create({
         data: {
-          total: parseFloat(total),
+          total: saleTotal,
           paymentMethod,
           customerName,
-          amountReceived: parseFloat(amountReceived) || total,
+          amountReceived: parseFloat(amountReceived) || saleTotal,
           change: parseFloat(change) || 0,
           date: parseISO(date),
           items: {
@@ -2141,7 +2191,7 @@ app.post('/api/sales', async (req, res) => {
           data: {
             estoqueId: item.id,
             type: 'SALE',
-            quantity: -item.quantity, // negativo = saída
+            quantity: -item.quantity,
             previousStock: previousStock,
             newStock: newStock,
             description: `Venda #${sale.id} - ${item.name} (${item.quantity}x)`,
@@ -2149,6 +2199,43 @@ app.post('/api/sales', async (req, res) => {
             referenceType: 'Sale'
           }
         });
+      }
+
+      // 3. Se pendente, criar registros de fiado (Purchase) e atualizar dívida do cliente
+      if (pendente && pendente.clientId) {
+        const valorPendente = splitPay
+          ? parseFloat((splitPay.find(s => s.forma === "pendente") || {}).valor || 0)
+          : saleTotal;
+
+        // Criar Purchase (fiado) para cada item
+        for (const item of items) {
+          await tx.purchase.create({
+            data: {
+              product: item.name,
+              quantity: item.quantity,
+              total: item.price * item.quantity,
+              date: parseISO(date),
+              clientId: pendente.clientId,
+            }
+          });
+        }
+
+        // Atualizar totalDebt do cliente
+        await tx.client.update({
+          where: { id: pendente.clientId },
+          data: { totalDebt: { increment: valorPendente } }
+        });
+      }
+
+      // 4. Se cupom foi usado, incrementar vezesUsado
+      if (discount && discount.cupomCodigo) {
+        const cupom = await tx.pdvCupom.findFirst({ where: { codigo: discount.cupomCodigo } });
+        if (cupom) {
+          await tx.pdvCupom.update({
+            where: { id: cupom.id },
+            data: { vezesUsado: { increment: 1 } }
+          });
+        }
       }
 
       return sale;
