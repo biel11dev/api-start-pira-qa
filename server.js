@@ -4113,6 +4113,121 @@ app.get("/api/pdv-caixa-controle/:id/transacoes", async (req, res) => {
   }
 });
 
+// ===================== ROTAS GASTOS BAR (PDV) =====================
+
+// Listar gastos bar agrupados por semana
+app.get("/api/pdv-gastos-bar", async (req, res) => {
+  try {
+    const { tipo, semanas = 8 } = req.query;
+    const where = {};
+    if (tipo) where.tipo = tipo;
+
+    const gastos = await prisma.pdvGastoBar.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+    });
+
+    // Agrupar por semana (segunda a domingo)
+    const getWeekKey = (date) => {
+      const d = new Date(date);
+      const day = d.getDay();
+      const diff = d.getDate() - day + (day === 0 ? -6 : 1); // segunda
+      const monday = new Date(d.setDate(diff));
+      monday.setHours(0, 0, 0, 0);
+      return monday.toISOString().split("T")[0];
+    };
+
+    const semanasMap = {};
+    for (const g of gastos) {
+      const weekKey = getWeekKey(g.createdAt);
+      if (!semanasMap[weekKey]) semanasMap[weekKey] = { semana: weekKey, produtos: [], descontos: [], totalProdutos: 0, totalDescontos: 0, total: 0 };
+      if (g.tipo === "PRODUTO") {
+        semanasMap[weekKey].produtos.push(g);
+        semanasMap[weekKey].totalProdutos += g.valorTotal;
+      } else {
+        semanasMap[weekKey].descontos.push(g);
+        semanasMap[weekKey].totalDescontos += g.valorTotal;
+      }
+      semanasMap[weekKey].total += g.valorTotal;
+    }
+
+    const result = Object.values(semanasMap)
+      .sort((a, b) => b.semana.localeCompare(a.semana))
+      .slice(0, parseInt(semanas));
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar gastos bar", details: error.message });
+  }
+});
+
+// Registrar gasto bar (produto pego por funcionário ou desconto dado)
+app.post("/api/pdv-gastos-bar", async (req, res) => {
+  try {
+    const { tipo, funcionario, funcionarioId, descricao, quantidade, valorUnitario, valorTotal, saleId } = req.body;
+
+    if (!tipo || !funcionario || !valorTotal) {
+      return res.status(400).json({ error: "Tipo, funcionário e valor total são obrigatórios." });
+    }
+
+    const gasto = await prisma.pdvGastoBar.create({
+      data: {
+        tipo,
+        funcionario,
+        funcionarioId: funcionarioId || null,
+        descricao: descricao || null,
+        quantidade: quantidade ? parseFloat(quantidade) : null,
+        valorUnitario: valorUnitario ? parseFloat(valorUnitario) : null,
+        valorTotal: parseFloat(valorTotal),
+        saleId: saleId || null,
+      },
+    });
+
+    res.status(201).json(gasto);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao registrar gasto bar", details: error.message });
+  }
+});
+
+// Excluir gasto bar
+app.delete("/api/pdv-gastos-bar/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    await prisma.pdvGastoBar.delete({ where: { id } });
+    res.json({ message: "Gasto excluído com sucesso" });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao excluir gasto", details: error.message });
+  }
+});
+
+// Resumo por funcionário
+app.get("/api/pdv-gastos-bar/resumo", async (req, res) => {
+  try {
+    const { de, ate } = req.query;
+    const where = {};
+    if (de || ate) {
+      where.createdAt = {};
+      if (de) where.createdAt.gte = new Date(de);
+      if (ate) where.createdAt.lte = new Date(ate + "T23:59:59.999Z");
+    }
+
+    const gastos = await prisma.pdvGastoBar.findMany({ where, orderBy: { createdAt: "desc" } });
+
+    const porFunc = {};
+    for (const g of gastos) {
+      if (!porFunc[g.funcionario]) porFunc[g.funcionario] = { funcionario: g.funcionario, totalProdutos: 0, totalDescontos: 0, total: 0, itens: [] };
+      porFunc[g.funcionario].itens.push(g);
+      if (g.tipo === "PRODUTO") porFunc[g.funcionario].totalProdutos += g.valorTotal;
+      else porFunc[g.funcionario].totalDescontos += g.valorTotal;
+      porFunc[g.funcionario].total += g.valorTotal;
+    }
+
+    res.json(Object.values(porFunc).sort((a, b) => b.total - a.total));
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar resumo", details: error.message });
+  }
+});
+
 // ROTAS DE AUDITORIA
 app.get("/api/auditoria", async (req, res) => {
   try {

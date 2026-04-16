@@ -497,3 +497,21 @@ model PdvCaixaTransacao {
   @@index([tipo])
   @@index([createdAt])
 }
+
+model PdvGastoBar {
+  id            Int      @id @default(autoincrement())
+  tipo          String   // "PRODUTO" ou "DESCONTO"
+  funcionarioId Int?
+  funcionario   String   // nome do funcionário
+  descricao     String?  // nome do produto ou descrição do desconto
+  quantidade    Float?   // qtd de produtos
+  valorUnitario Float?   // valor unitário do produto
+  valorTotal    Float    // valor total do gasto/desconto
+  saleId        Int?     // venda que originou o desconto
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([tipo])
+  @@index([funcionarioId])
+  @@index([createdAt])
+}
