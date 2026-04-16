@@ -3917,7 +3917,8 @@ app.get("/api/pdv-caixa-controle/atual", async (req, res) => {
       // Calcular saldo atual
       const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
       const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
-      const saldoAtual = caixaAberto.saldoInicial + entradas - saidas;
+      // saldoInicial já está incluído como transação ABERTURA (ENTRADA), não somar duas vezes
+      const saldoAtual = entradas - saidas;
       const horasAberto = (new Date() - new Date(caixaAberto.abertoEm)) / (1000 * 60 * 60);
       return res.json({ ...caixaAberto, saldoAtual, totalEntradas: entradas, totalSaidas: saidas, horasAberto });
     }
