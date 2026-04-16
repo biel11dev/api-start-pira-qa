@@ -3903,6 +3903,215 @@ app.get("/api/pdv-comandas-pendentes", async (req, res) => {
   }
 });
 
+// ===================== ROTAS CAIXA CONTROLE (PDV) =====================
+
+// Obter caixa atual (aberto) ou último fechado
+app.get("/api/pdv-caixa-controle/atual", async (req, res) => {
+  try {
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({
+      where: { status: "ABERTO" },
+      include: { transacoes: { orderBy: { createdAt: "desc" } } },
+      orderBy: { abertoEm: "desc" },
+    });
+    if (caixaAberto) {
+      // Calcular saldo atual
+      const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
+      const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
+      const saldoAtual = caixaAberto.saldoInicial + entradas - saidas;
+      const horasAberto = (new Date() - new Date(caixaAberto.abertoEm)) / (1000 * 60 * 60);
+      return res.json({ ...caixaAberto, saldoAtual, totalEntradas: entradas, totalSaidas: saidas, horasAberto });
+    }
+    // Se não há caixa aberto, retorna o último fechado
+    const ultimoFechado = await prisma.pdvCaixaControle.findFirst({
+      where: { status: "FECHADO" },
+      orderBy: { fechadoEm: "desc" },
+    });
+    res.json({ caixaAberto: null, ultimoFechado });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar caixa atual", details: error.message });
+  }
+});
+
+// Histórico de caixas
+app.get("/api/pdv-caixa-controle/historico", async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [caixas, total] = await Promise.all([
+      prisma.pdvCaixaControle.findMany({
+        orderBy: { abertoEm: "desc" },
+        skip,
+        take: parseInt(limit),
+        include: { transacoes: { orderBy: { createdAt: "desc" } } },
+      }),
+      prisma.pdvCaixaControle.count(),
+    ]);
+    res.json({ caixas, total, pages: Math.ceil(total / parseInt(limit)) });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar histórico", details: error.message });
+  }
+});
+
+// Abrir novo caixa
+app.post("/api/pdv-caixa-controle/abrir", async (req, res) => {
+  try {
+    const { saldoInicial, observacao } = req.body;
+
+    // Verificar se já existe caixa aberto
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+    if (caixaAberto) {
+      return res.status(400).json({ error: "Já existe um caixa aberto! Feche-o antes de abrir um novo." });
+    }
+
+    // Extrair userId do token
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const novoCaixa = await prisma.pdvCaixaControle.create({
+      data: {
+        saldoInicial: parseFloat(saldoInicial) || 0,
+        observacao: observacao || null,
+        abertoPorId: userId,
+        abertoPorNome: userName,
+        transacoes: parseFloat(saldoInicial) > 0 ? {
+          create: {
+            tipo: "ENTRADA",
+            categoria: "ABERTURA",
+            valor: parseFloat(saldoInicial),
+            descricao: "Saldo inicial de abertura",
+            userId,
+            userName,
+          }
+        } : undefined,
+      },
+      include: { transacoes: true },
+    });
+
+    res.status(201).json(novoCaixa);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao abrir caixa", details: error.message });
+  }
+});
+
+// Fechar caixa
+app.put("/api/pdv-caixa-controle/fechar", async (req, res) => {
+  try {
+    const { observacao } = req.body;
+
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({
+      where: { status: "ABERTO" },
+      include: { transacoes: true },
+    });
+    if (!caixaAberto) {
+      return res.status(400).json({ error: "Nenhum caixa aberto para fechar." });
+    }
+
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
+    const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
+    const saldoFinal = caixaAberto.saldoInicial + entradas - saidas;
+
+    const caixaFechado = await prisma.pdvCaixaControle.update({
+      where: { id: caixaAberto.id },
+      data: {
+        status: "FECHADO",
+        saldoFinal,
+        totalEntradas: entradas,
+        totalSaidas: saidas,
+        fechadoPorId: userId,
+        fechadoPorNome: userName,
+        fechadoEm: new Date(),
+        observacao: observacao ? `${caixaAberto.observacao || ""} | Fechamento: ${observacao}`.trim() : caixaAberto.observacao,
+      },
+      include: { transacoes: true },
+    });
+
+    res.json(caixaFechado);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao fechar caixa", details: error.message });
+  }
+});
+
+// Registrar transação no caixa aberto
+app.post("/api/pdv-caixa-controle/transacao", async (req, res) => {
+  try {
+    const { tipo, categoria, valor, descricao } = req.body;
+
+    if (!tipo || !categoria || !valor || parseFloat(valor) <= 0) {
+      return res.status(400).json({ error: "Tipo, categoria e valor são obrigatórios." });
+    }
+
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+    if (!caixaAberto) {
+      return res.status(400).json({ error: "Nenhum caixa aberto. Abra um caixa antes de registrar transações." });
+    }
+
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const transacao = await prisma.pdvCaixaTransacao.create({
+      data: {
+        caixaId: caixaAberto.id,
+        tipo: tipo.toUpperCase(),
+        categoria: categoria.toUpperCase(),
+        valor: parseFloat(valor),
+        descricao: descricao || null,
+        userId,
+        userName,
+      },
+    });
+
+    res.status(201).json(transacao);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao registrar transação", details: error.message });
+  }
+});
+
+// Obter transações do caixa atual
+app.get("/api/pdv-caixa-controle/:id/transacoes", async (req, res) => {
+  try {
+    const transacoes = await prisma.pdvCaixaTransacao.findMany({
+      where: { caixaId: parseInt(req.params.id) },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(transacoes);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar transações", details: error.message });
+  }
+});
+
 // ROTAS DE AUDITORIA
 app.get("/api/auditoria", async (req, res) => {
   try {
