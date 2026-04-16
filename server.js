@@ -77,6 +77,8 @@ const auditoriaMiddleware = async (req, res, next) => {
   // Ignora rotas estáticas e de validação de token
   if (!req.path.startsWith("/api/")) return next();
   if (req.path === "/api/validate-token") return next();
+  // Ignora requisições GET para não poluir a auditoria
+  if (req.method === "GET") return next();
 
   // Captura a resposta original
   const originalJson = res.json.bind(res);
@@ -3282,6 +3284,19 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
           date: new Date(),
           DespesaFixa: false,
           tipoMovimento: "GASTO",
+          isVale: true,
+        },
+      });
+
+      // Criar registro de GANHO correspondente (fluxo padrão do VALE no Pessoal)
+      await prisma.despPessoal.create({
+        data: {
+          nomeDespesa: "VALE",
+          valorDespesa: parseFloat(valor),
+          descDespesa: `Vale referente a: Vale / Sangria (PDV)`,
+          date: new Date(),
+          DespesaFixa: false,
+          tipoMovimento: "GANHO",
           isVale: true,
         },
       });

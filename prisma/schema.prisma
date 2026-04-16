@@ -458,3 +458,42 @@ model PdvComandaItem {
 
   @@index([comandaId])
 }
+
+model PdvCaixaControle {
+  id              Int       @id @default(autoincrement())
+  status          String    @default("ABERTO") // "ABERTO", "FECHADO"
+  saldoInicial    Float     @default(0)
+  saldoFinal      Float?
+  totalEntradas   Float     @default(0)
+  totalSaidas     Float     @default(0)
+  observacao      String?
+  abertoPorId     Int?
+  abertoPorNome   String?
+  fechadoPorId    Int?
+  fechadoPorNome  String?
+  abertoEm        DateTime  @default(now())
+  fechadoEm       DateTime?
+  transacoes      PdvCaixaTransacao[]
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status])
+  @@index([abertoEm])
+}
+
+model PdvCaixaTransacao {
+  id          Int      @id @default(autoincrement())
+  caixaId     Int
+  caixa       PdvCaixaControle @relation(fields: [caixaId], references: [id], onDelete: Cascade)
+  tipo        String   // "ENTRADA", "SAIDA"
+  categoria   String   // "VENDA", "SANGRIA", "VALE", "ADD", "PREMIO", "TROCO", "ABERTURA", "OUTRO"
+  valor       Float
+  descricao   String?
+  userId      Int?
+  userName    String?
+  createdAt   DateTime @default(now())
+
+  @@index([caixaId])
+  @@index([tipo])
+  @@index([createdAt])
+}
