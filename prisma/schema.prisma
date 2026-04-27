@@ -111,6 +111,7 @@ model Estoque {
   valuecusto Float
   stockMovements StockMovement[]
   saleItems      SaleItem[]
+  composicoes    ComposicaoProduto[]
 
   @@index([productId])
 }
@@ -245,6 +246,7 @@ model SaleItem {
   quantity    Float
   unitPrice   Float
   total       Float
+  composicao  String?  // JSON com opções selecionadas pelo cliente
   sale        Sale     @relation(fields: [saleId], references: [id])
   estoque     Estoque  @relation(fields: [estoqueId], references: [id])
 }
@@ -514,4 +516,36 @@ model PdvGastoBar {
   @@index([tipo])
   @@index([funcionarioId])
   @@index([createdAt])
+}
+
+// ===== COMPOSIÇÃO DE PRODUTOS (componentes/variantes) =====
+
+model ComposicaoProduto {
+  id          Int      @id @default(autoincrement())
+  estoqueId   Int
+  nome        String   // Ex: "Selecionar Whisky", "Sabor do Gelo"
+  descricao   String?
+  obrigatorio Boolean  @default(true)
+  multiplo    Boolean  @default(false) // true = checkbox (múltipla escolha)
+  minOpcoes   Int      @default(1)
+  maxOpcoes   Int      @default(1)
+  ordem       Int      @default(0)
+  opcoes      ComposicaoOpcao[]
+  estoque     Estoque  @relation(fields: [estoqueId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([estoqueId])
+}
+
+model ComposicaoOpcao {
+  id           Int      @id @default(autoincrement())
+  composicaoId Int
+  composicao   ComposicaoProduto @relation(fields: [composicaoId], references: [id], onDelete: Cascade)
+  nome         String   // Ex: "Jack Daniel's", "Gelo de Limão", "Red Bull"
+  valorExtra   Float    @default(0)
+  disponivel   Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  @@index([composicaoId])
 }

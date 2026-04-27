@@ -523,11 +523,8 @@ app.get("/api/estoque_prod", async (req, res) => {
     const produtos = await prisma.estoque.findMany({
       include: {
         product: true,
-        category: {
-          include: {
-            parent: true
-          }
-        }
+        category: { include: { parent: true } },
+        composicoes: { include: { opcoes: { orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
     res.json(produtos);
@@ -542,11 +539,8 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
       where: { id: parseInt(req.params.id) },
       include: {
         product: true,
-        category: {
-          include: {
-            parent: true
-          }
-        }
+        category: { include: { parent: true } },
+        composicoes: { include: { opcoes: { orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
     res.json(product || { error: "Produto não encontrado" });
@@ -2109,15 +2103,21 @@ app.post('/api/sales', async (req, res) => {
   try {
     const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal } = req.body;
 
-    // Verificar estoque antes de prosseguir (busca na tabela Estoque)
+    // Verificar estoque antes de prosseguir (verificação inicial rápida)
     for (const item of items) {
       const estoqueItem = await prisma.estoque.findUnique({ where: { id: item.id } });
       if (!estoqueItem) {
         return res.status(400).json({ error: `Produto "${item.name}" não encontrado no estoque.` });
       }
       if (estoqueItem.quantity < item.quantity) {
-        return res.status(400).json({ 
-          error: `Estoque insuficiente para "${item.name}". Disponível: ${estoqueItem.quantity}, Solicitado: ${item.quantity}` 
+        // Buscar última venda que baixou este item para informar ao operador
+        const lastMovement = await prisma.stockMovement.findFirst({
+          where: { estoqueId: item.id, type: 'SALE' },
+          orderBy: { createdAt: 'desc' }
+        });
+        const saleRef = lastMovement?.referenceId ? ` Último desconto registrado na Venda #${lastMovement.referenceId}.` : '';
+        return res.status(400).json({
+          error: `Estoque insuficiente para "${item.name}". Disponível: ${estoqueItem.quantity}, Solicitado: ${item.quantity}.${saleRef}`
         });
       }
     }
@@ -2173,7 +2173,8 @@ app.post('/api/sales', async (req, res) => {
               productName: item.name,
               quantity: item.quantity,
               unitPrice: item.price,
-              total: item.price * item.quantity
+              total: item.price * item.quantity,
+              ...(item.composicao ? { composicao: item.composicao } : {})
             }))
           }
         },
@@ -2182,10 +2183,22 @@ app.post('/api/sales', async (req, res) => {
         }
       });
 
-      // 2. Dar baixa no ESTOQUE e registrar movimentações
+      // 2. Dar baixa no ESTOQUE e registrar movimentações (com re-verificação para concorrência)
       for (const item of items) {
+        // Re-verificar estoque dentro da transação (proteção contra race condition)
         const estoqueItem = await tx.estoque.findUnique({ where: { id: item.id } });
         const previousStock = estoqueItem.quantity;
+
+        if (previousStock < item.quantity) {
+          // Buscar última movimentação de venda para este item
+          const lastMovement = await tx.stockMovement.findFirst({
+            where: { estoqueId: item.id, type: 'SALE' },
+            orderBy: { createdAt: 'desc' }
+          });
+          const saleRef = lastMovement?.referenceId ? ` Último desconto registrado na Venda #${lastMovement.referenceId}.` : '';
+          throw new Error(`Estoque insuficiente para "${item.name}". Disponível: ${previousStock}, Solicitado: ${item.quantity}.${saleRef}`);
+        }
+
         const newStock = previousStock - item.quantity;
 
         // Atualizar quantidade no estoque
@@ -2477,6 +2490,99 @@ app.delete('/api/unit-equivalences/:unitName', async (req, res) => {
     }
     console.error('Erro ao excluir equivalência:', error);
     res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+// ===================== ROTAS DE COMPOSIÇÃO DE PRODUTOS =====================
+
+// Rotas de opções devem vir ANTES das rotas com :id para evitar conflitos de roteamento
+app.put('/api/composicoes/opcoes/:id', async (req, res) => {
+  try {
+    const { nome, valorExtra, disponivel } = req.body;
+    const opcao = await prisma.composicaoOpcao.update({
+      where: { id: parseInt(req.params.id) },
+      data: { nome, valorExtra: parseFloat(valorExtra) || 0, disponivel: disponivel !== false && disponivel !== 0 }
+    });
+    res.json(opcao);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao atualizar opção', details: error.message });
+  }
+});
+
+app.delete('/api/composicoes/opcoes/:id', async (req, res) => {
+  try {
+    await prisma.composicaoOpcao.delete({ where: { id: parseInt(req.params.id) } });
+    res.json({ message: 'Opção excluída' });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao excluir opção', details: error.message });
+  }
+});
+
+app.get('/api/composicoes/:estoqueId', async (req, res) => {
+  try {
+    const composicoes = await prisma.composicaoProduto.findMany({
+      where: { estoqueId: parseInt(req.params.estoqueId) },
+      include: { opcoes: { orderBy: { id: 'asc' } } },
+      orderBy: { ordem: 'asc' }
+    });
+    res.json(composicoes);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar composições', details: error.message });
+  }
+});
+
+app.post('/api/composicoes', async (req, res) => {
+  try {
+    const { estoqueId, nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem } = req.body;
+    if (!estoqueId || !nome) return res.status(400).json({ error: 'estoqueId e nome são obrigatórios' });
+    const comp = await prisma.composicaoProduto.create({
+      data: {
+        estoqueId: parseInt(estoqueId), nome, descricao: descricao || null,
+        obrigatorio: obrigatorio !== false, multiplo: !!multiplo,
+        minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1,
+        ordem: parseInt(ordem) || 0
+      },
+      include: { opcoes: true }
+    });
+    res.status(201).json(comp);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao criar composição', details: error.message });
+  }
+});
+
+app.put('/api/composicoes/:id', async (req, res) => {
+  try {
+    const { nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem } = req.body;
+    const comp = await prisma.composicaoProduto.update({
+      where: { id: parseInt(req.params.id) },
+      data: { nome, descricao, obrigatorio: !!obrigatorio, multiplo: !!multiplo, minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1, ordem: parseInt(ordem) || 0 },
+      include: { opcoes: true }
+    });
+    res.json(comp);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao atualizar composição', details: error.message });
+  }
+});
+
+app.delete('/api/composicoes/:id', async (req, res) => {
+  try {
+    await prisma.composicaoProduto.delete({ where: { id: parseInt(req.params.id) } });
+    res.json({ message: 'Composição excluída' });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao excluir composição', details: error.message });
+  }
+});
+
+app.post('/api/composicoes/:id/opcoes', async (req, res) => {
+  try {
+    const { nome, valorExtra, disponivel } = req.body;
+    if (!nome) return res.status(400).json({ error: 'Nome da opção é obrigatório' });
+    const opcao = await prisma.composicaoOpcao.create({
+      data: { composicaoId: parseInt(req.params.id), nome, valorExtra: parseFloat(valorExtra) || 0, disponivel: disponivel !== false }
+    });
+    res.status(201).json(opcao);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao criar opção', details: error.message });
   }
 });
 
