@@ -524,7 +524,8 @@ app.get("/api/estoque_prod", async (req, res) => {
       include: {
         product: true,
         category: { include: { parent: true } },
-        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } },
+        _count: { select: { composicaoOpcoes: true } }
       }
     });
     res.json(produtos);
