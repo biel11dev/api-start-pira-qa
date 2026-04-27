@@ -919,7 +919,101 @@ app.post("/api/estoque_prod/converter-reverso", async (req, res) => {
   }
 });
 
-app.post("/api/estoque_prod", async (req, res) => {
+// Converter qualquer unidade em porções customizadas (ex: Garrafa → Dose)
+app.post("/api/estoque_prod/converter-dose", async (req, res) => {
+  try {
+    const { estoqueId, quantityToConvert, targetUnit, yieldPerUnit, targetValue, targetValueCusto } = req.body;
+
+    if (!estoqueId || !quantityToConvert || !targetUnit || !yieldPerUnit) {
+      return res.status(400).json({ error: "estoqueId, quantityToConvert, targetUnit e yieldPerUnit são obrigatórios." });
+    }
+
+    const parsedQty = parseInt(quantityToConvert, 10);
+    const parsedYield = parseFloat(yieldPerUnit);
+    if (isNaN(parsedQty) || parsedQty <= 0 || isNaN(parsedYield) || parsedYield <= 0) {
+      return res.status(400).json({ error: "Quantidade e rendimento devem ser números válidos maiores que zero." });
+    }
+
+    const estoqueItem = await prisma.estoque.findUnique({
+      where: { id: parseInt(estoqueId) },
+      include: { product: true }
+    });
+    if (!estoqueItem) return res.status(404).json({ error: "Item não encontrado no estoque." });
+    if (estoqueItem.quantity < parsedQty) {
+      return res.status(400).json({ error: `Quantidade insuficiente. Disponível: ${estoqueItem.quantity} ${estoqueItem.unit}(s)` });
+    }
+
+    const portionsGenerated = Math.floor(parsedQty * parsedYield);
+    const sellValue = parseFloat(targetValue) || (estoqueItem.value / parsedYield);
+    const costValue = parseFloat(targetValueCusto) || (estoqueItem.valuecusto / parsedYield);
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Reduzir estoque da unidade fonte
+      const prevStock = estoqueItem.quantity;
+      const newStock = prevStock - parsedQty;
+      await tx.estoque.update({ where: { id: estoqueItem.id }, data: { quantity: newStock } });
+      await tx.stockMovement.create({
+        data: {
+          estoqueId: estoqueItem.id, type: 'CONVERSION_OUT',
+          quantity: -parsedQty, previousStock: prevStock, newStock: newStock,
+          description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${portionsGenerated}x ${targetUnit}`,
+          referenceType: 'Conversion'
+        }
+      });
+
+      // 2. Incrementar ou criar registro na unidade destino
+      const existingTarget = await tx.estoque.findFirst({
+        where: { productId: estoqueItem.productId, unit: targetUnit }
+      });
+
+      let targetItem;
+      if (existingTarget) {
+        const prevTarget = existingTarget.quantity;
+        const newTarget = prevTarget + portionsGenerated;
+        targetItem = await tx.estoque.update({ where: { id: existingTarget.id }, data: { quantity: newTarget } });
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: existingTarget.id, type: 'CONVERSION_IN',
+            quantity: portionsGenerated, previousStock: prevTarget, newStock: newTarget,
+            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${portionsGenerated}x ${targetUnit}`,
+            referenceType: 'Conversion'
+          }
+        });
+      } else {
+        targetItem = await tx.estoque.create({
+          data: {
+            productId: estoqueItem.productId,
+            name: estoqueItem.name,
+            quantity: portionsGenerated,
+            unit: targetUnit,
+            value: Math.round(sellValue * 100) / 100,
+            valuecusto: Math.round(costValue * 100) / 100,
+            categoria_Id: estoqueItem.categoria_Id
+          }
+        });
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: targetItem.id, type: 'CONVERSION_IN',
+            quantity: portionsGenerated, previousStock: 0, newStock: portionsGenerated,
+            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${portionsGenerated}x ${targetUnit} (novo registro)`,
+            referenceType: 'Conversion'
+          }
+        });
+      }
+
+      return {
+        origin: { id: estoqueItem.id, name: estoqueItem.name, unit: estoqueItem.unit, removed: parsedQty, remaining: newStock },
+        destination: { id: targetItem.id, name: estoqueItem.name, unit: targetUnit, added: portionsGenerated, total: targetItem.quantity },
+        yieldPerUnit: parsedYield
+      };
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error("Erro na conversão de dose:", error);
+    res.status(500).json({ error: "Erro ao converter em porções", details: error.message });
+  }
+
   try {
     const { name, quantity, unit, value, valuecusto, categoryId, productId } = req.body;
 
@@ -965,7 +1059,7 @@ app.post("/api/estoque_prod", async (req, res) => {
     res.status(201).json(newProduct);
   } catch (error) {
     res.status(500).json({ error: "Erro ao criar produto", details: error.message });
-  }
+      }
 });
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
