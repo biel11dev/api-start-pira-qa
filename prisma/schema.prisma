@@ -112,6 +112,7 @@ model Estoque {
   stockMovements StockMovement[]
   saleItems      SaleItem[]
   composicoes    ComposicaoProduto[]
+  composicaoOpcoes ComposicaoOpcao[]
 
   @@index([productId])
 }
@@ -545,7 +546,10 @@ model ComposicaoOpcao {
   nome         String   // Ex: "Jack Daniel's", "Gelo de Limão", "Red Bull"
   valorExtra   Float    @default(0)
   disponivel   Boolean  @default(true)
+  estoqueId    Int?     // Vinculado ao item de estoque contabilizável
+  estoque      Estoque? @relation(fields: [estoqueId], references: [id], onDelete: SetNull)
   createdAt    DateTime @default(now())
 
   @@index([composicaoId])
+  @@index([estoqueId])
 }

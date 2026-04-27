@@ -524,7 +524,7 @@ app.get("/api/estoque_prod", async (req, res) => {
       include: {
         product: true,
         category: { include: { parent: true } },
-        composicoes: { include: { opcoes: { orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
     res.json(produtos);
@@ -540,7 +540,7 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
       include: {
         product: true,
         category: { include: { parent: true } },
-        composicoes: { include: { opcoes: { orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
     res.json(product || { error: "Produto não encontrado" });
@@ -2222,6 +2222,41 @@ app.post('/api/sales', async (req, res) => {
         });
       }
 
+      // 2b. Dar baixa no estoque dos componentes de composição
+      for (const item of items) {
+        if (!item.composicao) continue;
+        let selections;
+        try { selections = JSON.parse(item.composicao); } catch { continue; }
+        // selections = { [composicaoId]: [opcaoId, ...] }
+        const allOpcaoIds = Object.values(selections).flat().map(Number).filter(Boolean);
+        if (allOpcaoIds.length === 0) continue;
+        const opcoes = await tx.composicaoOpcao.findMany({
+          where: { id: { in: allOpcaoIds }, estoqueId: { not: null } }
+        });
+        for (const opcao of opcoes) {
+          const estoqueComp = await tx.estoque.findUnique({ where: { id: opcao.estoqueId } });
+          if (!estoqueComp) continue;
+          const needed = item.quantity; // 1 unidade do componente por item vendido
+          if (estoqueComp.quantity < needed) {
+            throw new Error(`Estoque insuficiente para o componente "${opcao.nome}" (${estoqueComp.name}). Disponível: ${estoqueComp.quantity}, Necessário: ${needed}.`);
+          }
+          const newQty = estoqueComp.quantity - needed;
+          await tx.estoque.update({ where: { id: opcao.estoqueId }, data: { quantity: newQty } });
+          await tx.stockMovement.create({
+            data: {
+              estoqueId: opcao.estoqueId,
+              type: 'SALE',
+              quantity: -needed,
+              previousStock: estoqueComp.quantity,
+              newStock: newQty,
+              description: `Venda #${sale.id} - Componente "${opcao.nome}" p/ ${item.name} (${needed}x)`,
+              referenceId: sale.id,
+              referenceType: 'Sale'
+            }
+          });
+        }
+      }
+
       // 3. Se pendente, criar COMANDA (NÃO fiado imediatamente) - fiado só após 24h sem pagamento
       if (pendente && pendente.clientId) {
         await tx.pdvComanda.create({
@@ -2498,10 +2533,16 @@ app.delete('/api/unit-equivalences/:unitName', async (req, res) => {
 // Rotas de opções devem vir ANTES das rotas com :id para evitar conflitos de roteamento
 app.put('/api/composicoes/opcoes/:id', async (req, res) => {
   try {
-    const { nome, valorExtra, disponivel } = req.body;
+    const { nome, valorExtra, disponivel, estoqueId } = req.body;
+    const updateData = {};
+    if (nome !== undefined) updateData.nome = nome;
+    if (valorExtra !== undefined) updateData.valorExtra = parseFloat(valorExtra) || 0;
+    if (disponivel !== undefined) updateData.disponivel = disponivel !== false && disponivel !== 0;
+    if (estoqueId !== undefined) updateData.estoqueId = estoqueId ? parseInt(estoqueId) : null;
     const opcao = await prisma.composicaoOpcao.update({
       where: { id: parseInt(req.params.id) },
-      data: { nome, valorExtra: parseFloat(valorExtra) || 0, disponivel: disponivel !== false && disponivel !== 0 }
+      data: updateData,
+      include: { estoque: { select: { id: true, name: true, quantity: true } } }
     });
     res.json(opcao);
   } catch (error) {
@@ -2522,7 +2563,7 @@ app.get('/api/composicoes/:estoqueId', async (req, res) => {
   try {
     const composicoes = await prisma.composicaoProduto.findMany({
       where: { estoqueId: parseInt(req.params.estoqueId) },
-      include: { opcoes: { orderBy: { id: 'asc' } } },
+      include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true } } }, orderBy: { id: 'asc' } } },
       orderBy: { ordem: 'asc' }
     });
     res.json(composicoes);
@@ -2575,10 +2616,17 @@ app.delete('/api/composicoes/:id', async (req, res) => {
 
 app.post('/api/composicoes/:id/opcoes', async (req, res) => {
   try {
-    const { nome, valorExtra, disponivel } = req.body;
+    const { nome, valorExtra, disponivel, estoqueId } = req.body;
     if (!nome) return res.status(400).json({ error: 'Nome da opção é obrigatório' });
     const opcao = await prisma.composicaoOpcao.create({
-      data: { composicaoId: parseInt(req.params.id), nome, valorExtra: parseFloat(valorExtra) || 0, disponivel: disponivel !== false }
+      data: {
+        composicaoId: parseInt(req.params.id),
+        nome,
+        valorExtra: parseFloat(valorExtra) || 0,
+        disponivel: disponivel !== false,
+        ...(estoqueId ? { estoqueId: parseInt(estoqueId) } : {})
+      },
+      include: { estoque: { select: { id: true, name: true, quantity: true } } }
     });
     res.status(201).json(opcao);
   } catch (error) {
