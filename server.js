@@ -2634,6 +2634,69 @@ app.post('/api/composicoes/:id/opcoes', async (req, res) => {
   }
 });
 
+// Cria produto no catálogo + entrada no estoque + opção de composição em uma só transação
+app.post('/api/composicoes/:id/opcao-estoque', async (req, res) => {
+  try {
+    const composicaoId = parseInt(req.params.id);
+    const { nome, unit, quantity, value, valuecusto, categoryId, valorExtra } = req.body;
+    if (!nome || !unit || quantity == null) {
+      return res.status(400).json({ error: 'nome, unit e quantity são obrigatórios' });
+    }
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Criar produto no catálogo
+      const product = await tx.product.create({
+        data: {
+          name: nome,
+          quantity: parseInt(quantity) || 0,
+          unit,
+          value: parseFloat(value) || 0,
+          valuecusto: parseFloat(valuecusto) || 0,
+          categoryId: categoryId ? parseInt(categoryId) : null
+        }
+      });
+      // 2. Criar entrada no estoque
+      const estoqueItem = await tx.estoque.create({
+        data: {
+          productId: product.id,
+          name: nome,
+          quantity: parseInt(quantity) || 0,
+          unit,
+          value: parseFloat(value) || 0,
+          valuecusto: parseFloat(valuecusto) || 0,
+          categoria_Id: categoryId ? parseInt(categoryId) : null
+        }
+      });
+      // 3. Registrar movimentação inicial
+      await tx.stockMovement.create({
+        data: {
+          estoqueId: estoqueItem.id,
+          type: 'ENTRY',
+          quantity: parseInt(quantity) || 0,
+          previousStock: 0,
+          newStock: parseInt(quantity) || 0,
+          description: `Cadastro inicial — ${nome}`,
+          referenceType: 'Manual'
+        }
+      });
+      // 4. Criar opção de composição vinculada
+      const opcao = await tx.composicaoOpcao.create({
+        data: {
+          composicaoId,
+          nome,
+          valorExtra: parseFloat(valorExtra) || 0,
+          disponivel: true,
+          estoqueId: estoqueItem.id
+        },
+        include: { estoque: { select: { id: true, name: true, quantity: true } } }
+      });
+      return { product, estoqueItem, opcao };
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao criar item de estoque e opção', details: error.message });
+  }
+});
+
 // ROTAS DE DESPESAS PESSOAIS
 app.get("/api/desp-pessoal", async (req, res) => {
   try {
