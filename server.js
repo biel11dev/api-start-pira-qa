@@ -1013,7 +1013,6 @@ app.post("/api/estoque_prod/converter-dose", async (req, res) => {
     console.error("Erro na conversão de dose:", error);
     res.status(500).json({ error: "Erro ao converter em porções", details: error.message });
   }
-
   try {
     const { name, quantity, unit, value, valuecusto, categoryId, productId } = req.body;
 
@@ -1059,7 +1058,7 @@ app.post("/api/estoque_prod/converter-dose", async (req, res) => {
     res.status(201).json(newProduct);
   } catch (error) {
     res.status(500).json({ error: "Erro ao criar produto", details: error.message });
-      }
+  }
 });
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
@@ -2552,7 +2551,7 @@ app.post('/api/unit-equivalences', async (req, res) => {
   try {
     const { unitName, value } = req.body;
     
-    if (!unitName || !value || value <= 0) {
+    if (!unitName || value === undefined || value === null || parseFloat(value) < 0) {
       return res.status(400).json({ error: 'Nome da unidade e valor são obrigatórios' });
     }
 
@@ -2585,8 +2584,8 @@ app.put('/api/unit-equivalences/:unitName', async (req, res) => {
     const { unitName } = req.params;
     const { value } = req.body;
     
-    if (!value || value <= 0) {
-      return res.status(400).json({ error: 'Valor é obrigatório e deve ser maior que zero' });
+    if (value === undefined || value === null || parseFloat(value) < 0) {
+      return res.status(400).json({ error: 'Valor é obrigatório e deve ser maior ou igual a zero' });
     }
 
     const equivalence = await prisma.unitEquivalence.update({
