@@ -113,6 +113,8 @@ model Estoque {
   saleItems      SaleItem[]
   composicoes    ComposicaoProduto[]
   composicaoOpcoes ComposicaoOpcao[]
+  estoqueMinimo  EstoqueMinimo?
+  listaCompras   ListaCompras[]
 
   @@index([productId])
 }
@@ -157,7 +159,7 @@ model Employee {
   valorHora   Float        @default(0) // Valor por hora do funcionário
   metaHoras   Float?       // Meta de horas semanais para bonificação (ATUAL)
   bonificacao Float?       // Valor da bonificação semanal
-  metasExtras String?      // JSON: array de {metaHoras, bonificacao} para metas adicionais
+  metasExtras String?  // JSON: array de {metaHoras, bonificacao} para metas adicionais
   contato     String?      // Contato do funcionário
   dataEntrada DateTime?    // Data de entrada do funcionário
   ativo       Boolean      @default(true) // Status do funcionário
@@ -555,4 +557,29 @@ model ComposicaoOpcao {
 
   @@index([composicaoId])
   @@index([estoqueId])
+}
+
+model EstoqueMinimo {
+  id               Int      @id @default(autoincrement())
+  estoqueId        Int      @unique
+  estoque          Estoque  @relation(fields: [estoqueId], references: [id], onDelete: Cascade)
+  quantidadeMinima Float    // Quantidade mínima ideal para o estoque
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model ListaCompras {
+  id               Int       @id @default(autoincrement())
+  estoqueId        Int
+  estoque          Estoque   @relation(fields: [estoqueId], references: [id], onDelete: Cascade)
+  nomeProduto      String
+  quantidadeAtual  Float
+  quantidadeMinima Float
+  status           String    @default("PENDENTE") // PENDENTE, CONCLUIDO
+  concluidoEm      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([estoqueId])
+  @@index([status])
 }

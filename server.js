@@ -640,10 +640,154 @@ app.post("/api/estoque_prod/entrada", async (req, res) => {
       return estoqueItem;
     });
 
+    // Após a transação: checar EstoqueMinimo e gerenciar ListaCompras
+    try {
+      const minimo = await prisma.estoqueMinimo.findUnique({ where: { estoqueId: result.id } });
+      if (minimo) {
+        if (result.quantity > minimo.quantidadeMinima) {
+          // Estoque voltou acima do mínimo → concluir entradas pendentes
+          await prisma.listaCompras.updateMany({
+            where: { estoqueId: result.id, status: "PENDENTE" },
+            data: { status: "CONCLUIDO", concluidoEm: new Date() }
+          });
+        } else {
+          // Ainda abaixo do mínimo → garantir que existe um registro PENDENTE
+          const pendente = await prisma.listaCompras.findFirst({
+            where: { estoqueId: result.id, status: "PENDENTE" }
+          });
+          if (!pendente) {
+            await prisma.listaCompras.create({
+              data: {
+                estoqueId: result.id,
+                nomeProduto: result.name,
+                quantidadeAtual: result.quantity,
+                quantidadeMinima: minimo.quantidadeMinima,
+                status: "PENDENTE"
+              }
+            });
+          } else {
+            await prisma.listaCompras.update({
+              where: { id: pendente.id },
+              data: { quantidadeAtual: result.quantity }
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Erro ao checar lista de compras após entrada:", e);
+    }
+
     res.status(201).json(result);
   } catch (error) {
     console.error("Erro na entrada de estoque:", error);
     res.status(500).json({ error: "Erro ao registrar entrada no estoque", details: error.message });
+  }
+});
+
+// ============================================================
+// ESTOQUE MÍNIMO
+// ============================================================
+
+// Listar todos os mínimos
+app.get("/api/estoque-minimo", async (req, res) => {
+  try {
+    const minimos = await prisma.estoqueMinimo.findMany({
+      include: { estoque: { select: { id: true, name: true, unit: true, quantity: true } } }
+    });
+    res.json(minimos);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao buscar mínimos", details: e.message });
+  }
+});
+
+// Criar ou atualizar mínimo de um item de estoque
+app.post("/api/estoque-minimo", async (req, res) => {
+  try {
+    const { estoqueId, quantidadeMinima } = req.body;
+    if (!estoqueId || quantidadeMinima == null) return res.status(400).json({ error: "estoqueId e quantidadeMinima são obrigatórios." });
+    const minimo = await prisma.estoqueMinimo.upsert({
+      where: { estoqueId: parseInt(estoqueId) },
+      create: { estoqueId: parseInt(estoqueId), quantidadeMinima: parseFloat(quantidadeMinima) },
+      update: { quantidadeMinima: parseFloat(quantidadeMinima) },
+      include: { estoque: { select: { id: true, name: true, unit: true, quantity: true } } }
+    });
+    // Checar imediatamente se já está abaixo do mínimo
+    if (minimo.estoque.quantity <= parseFloat(quantidadeMinima)) {
+      const pendente = await prisma.listaCompras.findFirst({ where: { estoqueId: parseInt(estoqueId), status: "PENDENTE" } });
+      if (!pendente) {
+        await prisma.listaCompras.create({
+          data: {
+            estoqueId: parseInt(estoqueId),
+            nomeProduto: minimo.estoque.name,
+            quantidadeAtual: minimo.estoque.quantity,
+            quantidadeMinima: parseFloat(quantidadeMinima),
+            status: "PENDENTE"
+          }
+        });
+      }
+    }
+    res.json(minimo);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao salvar mínimo", details: e.message });
+  }
+});
+
+// Remover mínimo
+app.delete("/api/estoque-minimo/:estoqueId", async (req, res) => {
+  try {
+    const estoqueId = parseInt(req.params.estoqueId);
+    await prisma.estoqueMinimo.deleteMany({ where: { estoqueId } });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao remover mínimo", details: e.message });
+  }
+});
+
+// ============================================================
+// LISTA DE COMPRAS
+// ============================================================
+
+// Listar (com filtro de status opcional)
+app.get("/api/lista-compras", async (req, res) => {
+  try {
+    const { status } = req.query;
+    const where = status ? { status } : {};
+    const lista = await prisma.listaCompras.findMany({
+      where,
+      include: { estoque: { select: { id: true, name: true, unit: true, quantity: true, category: { include: { parent: true } } } } },
+      orderBy: { createdAt: "desc" }
+    });
+    res.json(lista);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao buscar lista de compras", details: e.message });
+  }
+});
+
+// Concluir manualmente um item
+app.put("/api/lista-compras/:id/concluir", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const item = await prisma.listaCompras.update({
+      where: { id },
+      data: { status: "CONCLUIDO", concluidoEm: new Date() }
+    });
+    res.json(item);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao concluir item", details: e.message });
+  }
+});
+
+// Reabrir um item concluído
+app.put("/api/lista-compras/:id/reabrir", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const item = await prisma.listaCompras.update({
+      where: { id },
+      data: { status: "PENDENTE", concluidoEm: null }
+    });
+    res.json(item);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao reabrir item", details: e.message });
   }
 });
 
@@ -1013,6 +1157,7 @@ app.post("/api/estoque_prod/converter-dose", async (req, res) => {
     console.error("Erro na conversão de dose:", error);
     res.status(500).json({ error: "Erro ao converter em porções", details: error.message });
   }
+});
   try {
     const { name, quantity, unit, value, valuecusto, categoryId, productId } = req.body;
 
@@ -1058,8 +1203,7 @@ app.post("/api/estoque_prod/converter-dose", async (req, res) => {
     res.status(201).json(newProduct);
   } catch (error) {
     res.status(500).json({ error: "Erro ao criar produto", details: error.message });
-  }
-});
+  };
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
   try {
@@ -2200,7 +2344,8 @@ app.delete("/api/categories/:id", async (req, res) => {
 app.post('/api/sales', async (req, res) => {
   try {
     const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal } = req.body;
-    // Identificar operador pelo tok
+
+    // Identificar operador pelo token JWT
     let operatorName = null;
     try {
       const authHeader = req.headers.authorization;
@@ -3023,6 +3168,7 @@ app.get("/api/employee-meta/:employeeId", async (req, res) => {
   }
 });
 
+
 // GET - Buscar todo o histórico de metas de um funcionário
 app.get("/api/employee-meta-history/:employeeId", async (req, res) => {
   try {
@@ -3271,6 +3417,7 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
     res.status(500).json({ error: "Erro ao salvar meta semanal", details: error.message });
   }
 });
+
 
 // DELETE - Deletar meta semanal (volta a usar valores padrão do funcionário)
 app.delete("/api/employee-weekly-meta/:id", async (req, res) => {
