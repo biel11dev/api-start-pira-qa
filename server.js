@@ -1487,6 +1487,7 @@ app.post("/api/employees", async (req, res) => {
       valorHora = 0, 
       metaHoras = null, 
       bonificacao = null,
+      metasExtras = null,
       contato = null,
       dataEntrada = null,
       ativo = true
@@ -1500,6 +1501,7 @@ app.post("/api/employees", async (req, res) => {
         valorHora: parseFloat(valorHora) || 0,
         metaHoras: metaHoras ? parseFloat(metaHoras) : null,
         bonificacao: bonificacao ? parseFloat(bonificacao) : null,
+        metasExtras: metasExtras ? JSON.stringify(metasExtras) : null,
         contato,
         dataEntrada: dataEntrada ? new Date(dataEntrada) : null,
         ativo
@@ -1520,6 +1522,7 @@ app.put("/api/employees/:id", async (req, res) => {
       valorHora, 
       metaHoras, 
       bonificacao,
+      metasExtras,
       contato,
       dataEntrada,
       ativo
@@ -1533,6 +1536,7 @@ app.put("/api/employees/:id", async (req, res) => {
     if (valorHora !== undefined) updateData.valorHora = parseFloat(valorHora) || 0;
     if (metaHoras !== undefined) updateData.metaHoras = metaHoras ? parseFloat(metaHoras) : null;
     if (bonificacao !== undefined) updateData.bonificacao = bonificacao ? parseFloat(bonificacao) : null;
+    if (metasExtras !== undefined) updateData.metasExtras = metasExtras ? JSON.stringify(metasExtras) : null;
     if (contato !== undefined) updateData.contato = contato;
     if (dataEntrada !== undefined) updateData.dataEntrada = dataEntrada ? new Date(dataEntrada) : null;
     if (ativo !== undefined) updateData.ativo = ativo;
@@ -2196,6 +2200,17 @@ app.delete("/api/categories/:id", async (req, res) => {
 app.post('/api/sales', async (req, res) => {
   try {
     const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal } = req.body;
+    // Identificar operador pelo tok
+    let operatorName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        const user = await prisma.user.findUnique({ where: { id: decoded.userId }, select: { name: true } });
+        if (user) operatorName = user.name;
+      }
+    } catch {}
 
     // Verificar estoque antes de prosseguir (verificação inicial rápida)
     for (const item of items) {
@@ -3116,19 +3131,21 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
         // Se não existe meta específica, retornar valores padrão do funcionário
         const employee = await prisma.employee.findUnique({
           where: { id: employeeId },
-          select: { valorHora: true, metaHoras: true, bonificacao: true }
+          select: { valorHora: true, metaHoras: true, bonificacao: true, metasExtras: true }
         });
         
         return res.json({
           metaHoras: employee?.metaHoras || null,
           bonificacao: employee?.bonificacao || null,
           valorHora: employee?.valorHora || null,
+          metasExtras: employee?.metasExtras ? JSON.parse(employee.metasExtras) : null,
           isDefault: true
         });
       }
 
       return res.json({
         ...meta,
+        metasExtras: meta.metasExtras ? JSON.parse(meta.metasExtras) : null,
         isDefault: false
       });
     }
@@ -3151,19 +3168,21 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
         // Se não existe meta específica, retornar valores padrão do funcionário
         const employee = await prisma.employee.findUnique({
           where: { id: employeeId },
-          select: { valorHora: true, metaHoras: true, bonificacao: true }
+          select: { valorHora: true, metaHoras: true, bonificacao: true, metasExtras: true }
         });
         
         return res.json({
           metaHoras: employee?.metaHoras || null,
           bonificacao: employee?.bonificacao || null,
           valorHora: employee?.valorHora || null,
+          metasExtras: employee?.metasExtras ? JSON.parse(employee.metasExtras) : null,
           isDefault: true
         });
       }
 
       return res.json({
         ...meta,
+        metasExtras: meta.metasExtras ? JSON.parse(meta.metasExtras) : null,
         isDefault: false
       });
     }
@@ -3189,7 +3208,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
 // POST - Criar ou atualizar meta semanal
 app.post("/api/employee-weekly-meta", async (req, res) => {
   try {
-    const { employeeId, weekStart, metaHoras, bonificacao, valorHora, year, month } = req.body;
+    const { employeeId, weekStart, metaHoras, bonificacao, valorHora, year, month, metasExtras } = req.body;
 
     if (!employeeId || !weekStart || metaHoras === undefined || bonificacao === undefined || valorHora === undefined) {
       return res.status(400).json({ error: "Dados incompletos" });
@@ -3213,6 +3232,8 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
       }
     });
 
+    const metasExtrasJson = metasExtras ? JSON.stringify(metasExtras) : null;
+
     let result;
     if (existingMeta) {
       // Atualizar meta existente
@@ -3222,7 +3243,8 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
           weekEnd: weekEndDate,
           metaHoras: parseFloat(metaHoras),
           bonificacao: parseFloat(bonificacao),
-          valorHora: parseFloat(valorHora)
+          valorHora: parseFloat(valorHora),
+          metasExtras: metasExtrasJson
         }
       });
     } else {
@@ -3236,7 +3258,8 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
           month: month || weekStartDate.getMonth() + 1,
           metaHoras: parseFloat(metaHoras),
           bonificacao: parseFloat(bonificacao),
-          valorHora: parseFloat(valorHora)
+          valorHora: parseFloat(valorHora),
+          metasExtras: metasExtrasJson
         }
       });
     }
