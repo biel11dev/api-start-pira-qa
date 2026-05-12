@@ -2207,8 +2207,8 @@ app.post('/api/sales', async (req, res) => {
       if (authHeader && authHeader.startsWith("Bearer ")) {
         const token = authHeader.split(" ")[1];
         const decoded = jwt.verify(token, SECRET_KEY);
-        const user = await prisma.user.findUnique({ where: { id: decoded.userId }, select: { name: true } });
-        if (user) operatorName = user.name;
+        const user = await prisma.user.findUnique({ where: { id: decoded.userId }, select: { name: true, username: true } });
+        if (user) operatorName = user.name || user.username;
       }
     } catch {}
 
@@ -2276,6 +2276,7 @@ app.post('/api/sales', async (req, res) => {
           amountReceived: parseFloat(amountReceived) || saleTotal,
           change: parseFloat(change) || 0,
           date: parseISO(date),
+          operator: operatorName,
           items: {
             create: items.map(item => ({
               estoqueId: item.id,
