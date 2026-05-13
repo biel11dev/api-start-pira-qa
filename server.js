@@ -1158,6 +1158,8 @@ app.post("/api/estoque_prod/converter-dose", async (req, res) => {
     res.status(500).json({ error: "Erro ao converter em porções", details: error.message });
   }
 });
+
+app.post("/api/estoque_prod", async (req, res) => {
   try {
     const { name, quantity, unit, value, valuecusto, categoryId, productId } = req.body;
 
@@ -1203,7 +1205,8 @@ app.post("/api/estoque_prod/converter-dose", async (req, res) => {
     res.status(201).json(newProduct);
   } catch (error) {
     res.status(500).json({ error: "Erro ao criar produto", details: error.message });
-  };
+  }
+});
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
   try {
