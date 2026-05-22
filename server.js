@@ -2552,6 +2552,39 @@ app.post('/api/sales', async (req, res) => {
       return sale;
     });
 
+    // 5. Registrar entrada no caixa aberto (fora da transação para evitar isolamento)
+    try {
+      const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+      if (caixaAberto) {
+        // Não registrar vendas 100% pendentes (fiado) como entrada imediata no caixa
+        const isPendenteTotal = !splitPay && paymentMethod?.toLowerCase().includes("pendente");
+        const valorEntrada = splitPay
+          ? splitPay
+              .filter(s => s.forma !== "pendente")
+              .reduce((acc, s) => acc + (parseFloat(s.valor) || 0), 0)
+          : isPendenteTotal ? 0 : saleTotal;
+
+        if (valorEntrada > 0) {
+          const descricaoEntrada = `Venda #${result.id} — ${customerName || "Cliente não identificado"}` +
+            (splitPay ? ` (${splitPay.map(s => `${s.forma}: R$${parseFloat(s.valor).toFixed(2)}`).join(", ")})` : ` — ${paymentMethod}`);
+
+          await prisma.pdvCaixaTransacao.create({
+            data: {
+              caixaId: caixaAberto.id,
+              tipo: "ENTRADA",
+              categoria: "VENDA",
+              valor: valorEntrada,
+              descricao: descricaoEntrada,
+              userId: null,
+              userName: operatorName || null,
+            },
+          });
+        }
+      }
+    } catch (caixaErr) {
+      console.error("Erro ao registrar transação no caixa (não crítico):", caixaErr.message);
+    }
+
     res.status(201).json(result);
   } catch (error) {
     console.error('Erro ao criar venda:', error);
@@ -4618,10 +4651,10 @@ app.put("/api/pdv-caixa-controle/fechar", async (req, res) => {
       date: dataOperacional,
       cartao: valorCartaoDia,
       dinheiro: valorDinheiroDia,
-      balance: saldoInicialPrincipal,
+      balance: parseFloat(caixaAberto.saldoInicial.toFixed(2)), // saldo de abertura do sub-caixa
       cartaofimcaixa: valorCartaoDia,
       dinheirofimcaixa: valorDinheiroDia,
-      balancefim: saldoInicialPrincipal,
+      balancefim: parseFloat((valorDinheiroDia + valorCartaoDia).toFixed(2)),
       lucro: 0,
     };
 
