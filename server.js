@@ -3281,7 +3281,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
         // Se não existe meta específica, retornar valores padrão do funcionário
         const employee = await prisma.employee.findUnique({
           where: { id: employeeId },
-          select: { valorHora: true, metaHoras: true, bonificacao: true, metasExtras: true }
+          select: { valorHora: true, metaHoras: true, bonificacao: true }
         });
         
         return res.json({
@@ -3318,7 +3318,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
         // Se não existe meta específica, retornar valores padrão do funcionário
         const employee = await prisma.employee.findUnique({
           where: { id: employeeId },
-          select: { valorHora: true, metaHoras: true, bonificacao: true, metasExtras: true }
+          select: { valorHora: true, metaHoras: true, bonificacao: true }
         });
         
         return res.json({
@@ -3358,7 +3358,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
 // POST - Criar ou atualizar meta semanal
 app.post("/api/employee-weekly-meta", async (req, res) => {
   try {
-    const { employeeId, weekStart, metaHoras, bonificacao, valorHora, year, month, metasExtras } = req.body;
+    const { employeeId, weekStart, metaHoras, bonificacao, valorHora, year, month } = req.body;
 
     if (!employeeId || !weekStart || metaHoras === undefined || bonificacao === undefined || valorHora === undefined) {
       return res.status(400).json({ error: "Dados incompletos" });
@@ -3393,8 +3393,7 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
           weekEnd: weekEndDate,
           metaHoras: parseFloat(metaHoras),
           bonificacao: parseFloat(bonificacao),
-          valorHora: parseFloat(valorHora),
-          metasExtras: metasExtrasJson
+          valorHora: parseFloat(valorHora)
         }
       });
     } else {
@@ -3408,8 +3407,7 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
           month: month || weekStartDate.getMonth() + 1,
           metaHoras: parseFloat(metaHoras),
           bonificacao: parseFloat(bonificacao),
-          valorHora: parseFloat(valorHora),
-          metasExtras: metasExtrasJson
+          valorHora: parseFloat(valorHora)
         }
       });
     }
@@ -4518,6 +4516,50 @@ app.put("/api/pdv-caixa-controle/fechar", async (req, res) => {
     const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
     const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
     const saldoFinal = caixaAberto.saldoInicial + entradas - saidas;
+    const fechadoEm = new Date();
+
+    // Helpers de integração com Caixa Principal
+    const parseValorBRL = (valorStr) => {
+      if (!valorStr) return 0;
+      const normalizado = String(valorStr).replace(/\./g, "").replace(",", ".");
+      const v = parseFloat(normalizado);
+      return Number.isFinite(v) ? v : 0;
+    };
+
+    const extrairTotaisPorForma = (sale) => {
+      const payment = (sale.paymentMethod || "").trim();
+      const totalVenda = parseFloat(sale.total) || 0;
+
+      let dinheiro = 0;
+      let cartao = 0;
+
+      // Split gravado em string: "Dinheiro (R$ 10,00) + PIX (R$ 20,00)"
+      const regexSplit = /([^+]+?)\s*\(R\$\s*([0-9\.,]+)\)/gi;
+      let match;
+      let encontrouSplit = false;
+
+      while ((match = regexSplit.exec(payment)) !== null) {
+        encontrouSplit = true;
+        const nomeForma = (match[1] || "").toLowerCase().trim();
+        const valorForma = parseValorBRL(match[2]);
+        if (nomeForma.includes("dinheiro")) dinheiro += valorForma;
+        else cartao += valorForma; // regra: tudo que não é dinheiro conta como cartão
+      }
+
+      if (!encontrouSplit) {
+        if (payment.toLowerCase().includes("dinheiro")) dinheiro += totalVenda;
+        else cartao += totalVenda; // regra: tudo que não é dinheiro conta como cartão
+      }
+
+      return { dinheiro, cartao };
+    };
+
+    const formatDateYMD = (dateObj) => {
+      const y = dateObj.getFullYear();
+      const m = String(dateObj.getMonth() + 1).padStart(2, "0");
+      const d = String(dateObj.getDate()).padStart(2, "0");
+      return `${y}-${m}-${d}`;
+    };
 
     const caixaFechado = await prisma.pdvCaixaControle.update({
       where: { id: caixaAberto.id },
@@ -4528,11 +4570,69 @@ app.put("/api/pdv-caixa-controle/fechar", async (req, res) => {
         totalSaidas: saidas,
         fechadoPorId: userId,
         fechadoPorNome: userName,
-        fechadoEm: new Date(),
+        fechadoEm,
         observacao: observacao ? `${caixaAberto.observacao || ""} | Fechamento: ${observacao}`.trim() : caixaAberto.observacao,
       },
       include: { transacoes: true },
     });
+
+    // ================= INTEGRAÇÃO SUB-CAIXA (PDV) -> CAIXA PRINCIPAL =================
+    // Período operacional do caixa: abertura (dia N) até fechamento (dia N+1)
+    const vendasPeriodo = await prisma.sale.findMany({
+      where: {
+        date: {
+          gte: new Date(caixaAberto.abertoEm),
+          lte: fechadoEm,
+        },
+      },
+      select: {
+        id: true,
+        total: true,
+        paymentMethod: true,
+      },
+    });
+
+    const totais = vendasPeriodo.reduce(
+      (acc, sale) => {
+        const { dinheiro, cartao } = extrairTotaisPorForma(sale);
+        acc.dinheiro += dinheiro;
+        acc.cartao += cartao;
+        return acc;
+      },
+      { dinheiro: 0, cartao: 0 }
+    );
+
+    const valorDinheiroDia = parseFloat(totais.dinheiro.toFixed(2));
+    const valorCartaoDia = parseFloat(totais.cartao.toFixed(2));
+    const saldoInicialPrincipal = parseFloat((valorDinheiroDia + valorCartaoDia).toFixed(2));
+
+    // Data do caixa principal segue o dia operacional de ABERTURA do sub-caixa
+    const dataOperacional = formatDateYMD(new Date(caixaAberto.abertoEm));
+
+    const balanceExistente = await prisma.balance.findFirst({
+      where: { date: dataOperacional },
+      orderBy: { id: "desc" },
+    });
+
+    const payloadBalance = {
+      date: dataOperacional,
+      cartao: valorCartaoDia,
+      dinheiro: valorDinheiroDia,
+      balance: saldoInicialPrincipal,
+      cartaofimcaixa: valorCartaoDia,
+      dinheirofimcaixa: valorDinheiroDia,
+      balancefim: saldoInicialPrincipal,
+      lucro: 0,
+    };
+
+    if (balanceExistente) {
+      await prisma.balance.update({
+        where: { id: balanceExistente.id },
+        data: payloadBalance,
+      });
+    } else {
+      await prisma.balance.create({ data: payloadBalance });
+    }
 
     res.json(caixaFechado);
   } catch (error) {
