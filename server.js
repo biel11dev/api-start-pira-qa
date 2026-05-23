@@ -2360,22 +2360,41 @@ app.post('/api/sales', async (req, res) => {
       }
     } catch {}
 
-    // Verificar estoque antes de prosseguir (verificação inicial rápida)
+    // Verificar estoque antes de prosseguir (verificação inicial rápida, considera conversão automática)
+    const allEqsCheck = await prisma.unitEquivalence.findMany();
+    const eqMapCheck = {};
+    allEqsCheck.forEach(e => { eqMapCheck[e.unitName] = e.value; });
+
     for (const item of items) {
       const estoqueItem = await prisma.estoque.findUnique({ where: { id: item.id } });
       if (!estoqueItem) {
         return res.status(400).json({ error: `Produto "${item.name}" não encontrado no estoque.` });
       }
       if (estoqueItem.quantity < item.quantity) {
-        // Buscar última venda que baixou este item para informar ao operador
-        const lastMovement = await prisma.stockMovement.findFirst({
-          where: { estoqueId: item.id, type: 'SALE' },
-          orderBy: { createdAt: 'desc' }
+        // Verificar se há conversão automática possível a partir de unidade irmã
+        const currentUnitVal = eqMapCheck[estoqueItem.unit] || 1;
+        const deficit = item.quantity - estoqueItem.quantity;
+        const siblings = await prisma.estoque.findMany({
+          where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
         });
-        const saleRef = lastMovement?.referenceId ? ` Último desconto registrado na Venda #${lastMovement.referenceId}.` : '';
-        return res.status(400).json({
-          error: `Estoque insuficiente para "${item.name}". Disponível: ${estoqueItem.quantity}, Solicitado: ${item.quantity}.${saleRef}`
-        });
+        let canConvert = false;
+        for (const sib of siblings) {
+          const sibVal = eqMapCheck[sib.unit];
+          if (!sibVal || sibVal <= currentUnitVal) continue;
+          const ratio = sibVal / currentUnitVal;
+          const neededSiblings = Math.ceil(deficit / ratio);
+          if (sib.quantity >= neededSiblings) { canConvert = true; break; }
+        }
+        if (!canConvert) {
+          const lastMovement = await prisma.stockMovement.findFirst({
+            where: { estoqueId: item.id, type: 'SALE' },
+            orderBy: { createdAt: 'desc' }
+          });
+          const saleRef = lastMovement?.referenceId ? ` Último desconto registrado na Venda #${lastMovement.referenceId}.` : '';
+          return res.status(400).json({
+            error: `Estoque insuficiente para "${item.name}" (${estoqueItem.unit}). Disponível: ${estoqueItem.quantity}, Solicitado: ${item.quantity}.${saleRef}`
+          });
+        }
       }
     }
 
@@ -2441,37 +2460,111 @@ app.post('/api/sales', async (req, res) => {
         }
       });
 
-      // 2. Dar baixa no ESTOQUE e registrar movimentações (com re-verificação para concorrência)
+      // 2. Dar baixa no ESTOQUE e registrar movimentações (com conversão automática de unidades)
+      const allEqs = await tx.unitEquivalence.findMany();
+      const eqMap = {};
+      allEqs.forEach(e => { eqMap[e.unitName] = e.value; });
+
       for (const item of items) {
         // Re-verificar estoque dentro da transação (proteção contra race condition)
-        const estoqueItem = await tx.estoque.findUnique({ where: { id: item.id } });
-        const previousStock = estoqueItem.quantity;
+        let estoqueItem = await tx.estoque.findUnique({ where: { id: item.id } });
+        let currentStock = estoqueItem.quantity;
 
-        if (previousStock < item.quantity) {
-          // Buscar última movimentação de venda para este item
-          const lastMovement = await tx.stockMovement.findFirst({
-            where: { estoqueId: item.id, type: 'SALE' },
-            orderBy: { createdAt: 'desc' }
+        // Se estoque insuficiente, tentar conversão automática de unidade irmã
+        if (currentStock < item.quantity) {
+          const currentUnitVal = eqMap[estoqueItem.unit] || 1;
+          const deficit = item.quantity - currentStock;
+
+          // Buscar itens do mesmo produto com unidade diferente
+          const siblings = await tx.estoque.findMany({
+            where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
           });
-          const saleRef = lastMovement?.referenceId ? ` Último desconto registrado na Venda #${lastMovement.referenceId}.` : '';
-          throw new Error(`Estoque insuficiente para "${item.name}". Disponível: ${previousStock}, Solicitado: ${item.quantity}.${saleRef}`);
+
+          let conversionDone = false;
+          for (const sibling of siblings) {
+            const siblingUnitVal = eqMap[sibling.unit];
+            if (!siblingUnitVal || siblingUnitVal <= currentUnitVal) continue; // deve ser unidade "maior"
+
+            const ratio = siblingUnitVal / currentUnitVal; // ex: 1 Unidade = 9 Doses → ratio=9
+            const neededSiblings = Math.ceil(deficit / ratio);
+
+            if (sibling.quantity < neededSiblings) continue; // irmã também sem estoque suficiente
+
+            const gainedCurrentUnits = neededSiblings * ratio;
+            const siblingPrevStock = sibling.quantity;
+            const siblingNewStock = sibling.quantity - neededSiblings;
+
+            // Baixar da unidade irmã (maior)
+            await tx.estoque.update({
+              where: { id: sibling.id },
+              data: { quantity: siblingNewStock }
+            });
+
+            // Registrar movimentação de conversão na unidade irmã
+            await tx.stockMovement.create({
+              data: {
+                estoqueId: sibling.id,
+                type: 'CONVERSION',
+                quantity: -neededSiblings,
+                previousStock: siblingPrevStock,
+                newStock: siblingNewStock,
+                description: `Conversão automática p/ Venda #${sale.id}: ${neededSiblings}x ${sibling.unit} → ${gainedCurrentUnits}x ${estoqueItem.unit} (${item.name})`,
+                referenceId: sale.id,
+                referenceType: 'Sale'
+              }
+            });
+
+            // Adicionar unidades convertidas ao estoque atual antes de baixar a venda
+            const stockAfterConversion = currentStock + gainedCurrentUnits;
+            await tx.estoque.update({
+              where: { id: item.id },
+              data: { quantity: stockAfterConversion }
+            });
+
+            // Registrar movimentação de entrada pela conversão
+            await tx.stockMovement.create({
+              data: {
+                estoqueId: item.id,
+                type: 'CONVERSION',
+                quantity: gainedCurrentUnits,
+                previousStock: currentStock,
+                newStock: stockAfterConversion,
+                description: `Conversão automática de ${neededSiblings}x ${sibling.unit} → ${gainedCurrentUnits}x ${estoqueItem.unit} p/ Venda #${sale.id}`,
+                referenceId: sale.id,
+                referenceType: 'Sale'
+              }
+            });
+
+            currentStock = stockAfterConversion;
+            conversionDone = true;
+            break;
+          }
+
+          if (!conversionDone) {
+            const lastMovement = await tx.stockMovement.findFirst({
+              where: { estoqueId: item.id, type: 'SALE' },
+              orderBy: { createdAt: 'desc' }
+            });
+            const saleRef = lastMovement?.referenceId ? ` Último desconto registrado na Venda #${lastMovement.referenceId}.` : '';
+            throw new Error(`Estoque insuficiente para "${item.name}" (${estoqueItem.unit}). Disponível: ${estoqueItem.quantity}, Solicitado: ${item.quantity}.${saleRef}`);
+          }
         }
 
-        const newStock = previousStock - item.quantity;
+        const newStock = currentStock - item.quantity;
 
-        // Atualizar quantidade no estoque
+        // Baixar do estoque (após eventual conversão)
         await tx.estoque.update({
           where: { id: item.id },
           data: { quantity: newStock }
         });
 
-        // Registrar movimentação de estoque
+        // Registrar movimentação de venda
         await tx.stockMovement.create({
           data: {
             estoqueId: item.id,
             type: 'SALE',
             quantity: -item.quantity,
-            previousStock: previousStock,
+            previousStock: currentStock,
             newStock: newStock,
             description: `Venda #${sale.id} - ${item.name} (${item.quantity}x)`,
             referenceId: sale.id,
