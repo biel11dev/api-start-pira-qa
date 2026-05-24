@@ -193,13 +193,38 @@ Equipe Start Pira`,
 
 // ROTAS DE AUTENTICAÇÃO
 app.post("/api/register", async (req, res) => {
-  const { username, password, name } = req.body;
+  const { username, password, name, funcionario } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = await prisma.user.create({ data: { username, password: hashedPassword, name: name || null } });
+    const newUser = await prisma.user.create({
+      data: {
+        username,
+        password: hashedPassword,
+        name: name || null,
+        funcionario: funcionario ?? false,
+      },
+    });
+
+    // Se for funcionário, criar registro no Ponto (Employee) com valores padrão
+    if (funcionario) {
+      await prisma.employee.create({
+        data: {
+          name: name || username,
+          position: null,
+          carga: 0,
+          valorHora: 0,
+          metaHoras: null,
+          bonificacao: null,
+          contato: null,
+          dataEntrada: new Date(),
+          ativo: true,
+        },
+      });
+    }
+
     res.json(newUser);
   } catch (error) {
-    console.log("Dados recebidos:", req.body); // Log dos dados recebidos
+    console.log("Dados recebidos:", req.body);
     res.status(400).json({ error: "Erro ao registrar usuário", details: error.message });
   }
 });
@@ -227,6 +252,7 @@ app.post("/api/login", async (req, res) => {
     token,
     username: user.username,
     name: user.name,
+    funcionario: user.funcionario,
     permissions: {
       caixa: user.caixa,
       produtos: user.produtos,
@@ -246,9 +272,9 @@ app.post("/api/login", async (req, res) => {
 app.put("/api/users/:id", async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
-    const { name, caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv, pessoal, auditoria } = req.body;
+    const { name, funcionario, caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv, pessoal, auditoria } = req.body;
 
-    const updateData = { caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv, pessoal, auditoria };
+    const updateData = { funcionario, caixa, produtos, maquinas, fiado, despesas, ponto, acessos, base_produto, pdv, pessoal, auditoria };
     if (name !== undefined) updateData.name = name;
 
     const updatedUser = await prisma.user.update({
@@ -2363,7 +2389,7 @@ app.post('/api/sales', async (req, res) => {
     // Verificar estoque antes de prosseguir (verificação inicial rápida, considera conversão automática)
     const allEqsCheck = await prisma.unitEquivalence.findMany();
     const eqMapCheck = {};
-    allEqsCheck.forEach(e => { eqMapCheck[e.unitName] = e.value; });
+    allEqsCheck.forEach(e => { eqMapCheck[e.unitName] = e; }); // mapa com objeto completo
 
     for (const item of items) {
       const estoqueItem = await prisma.estoque.findUnique({ where: { id: item.id } });
@@ -2378,10 +2404,20 @@ app.post('/api/sales', async (req, res) => {
           where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
         });
         let canConvert = false;
-        for (const sib of siblings) {
-          const sibVal = eqMapCheck[sib.unit];
-          if (!sibVal || sibVal <= currentUnitVal) continue;
-          const ratio = sibVal / currentUnitVal;
+        const currentEqCheck = eqMapCheck[estoqueItem.unit];
+        for (const sib of siblings) {  
+          let ratio = null;
+          if (currentEqCheck?.isFractional && currentEqCheck?.fractionalValue > 1) {
+            // Unidade fracional (Dose): 1 irmão-pai → fractionalValue doses
+            ratio = currentEqCheck.fractionalValue;
+          } else {
+            // Unidade empacotada: comparar valores
+            const sibEq = eqMapCheck[sib.unit];
+            const currentVal = currentEqCheck?.value || 1;
+            const sibVal = sibEq?.value || 1;
+            if (sibVal > currentVal) ratio = sibVal / currentVal;
+          }
+          if (!ratio || ratio <= 1) continue;
           const neededSiblings = Math.ceil(deficit / ratio);
           if (sib.quantity >= neededSiblings) { canConvert = true; break; }
         }
@@ -2463,7 +2499,7 @@ app.post('/api/sales', async (req, res) => {
       // 2. Dar baixa no ESTOQUE e registrar movimentações (com conversão automática de unidades)
       const allEqs = await tx.unitEquivalence.findMany();
       const eqMap = {};
-      allEqs.forEach(e => { eqMap[e.unitName] = e.value; });
+      allEqs.forEach(e => { eqMap[e.unitName] = e; }); // mapa com objeto completo
 
       for (const item of items) {
         // Re-verificar estoque dentro da transação (proteção contra race condition)
@@ -2472,7 +2508,6 @@ app.post('/api/sales', async (req, res) => {
 
         // Se estoque insuficiente, tentar conversão automática de unidade irmã
         if (currentStock < item.quantity) {
-          const currentUnitVal = eqMap[estoqueItem.unit] || 1;
           const deficit = item.quantity - currentStock;
 
           // Buscar itens do mesmo produto com unidade diferente
@@ -2480,12 +2515,21 @@ app.post('/api/sales', async (req, res) => {
             where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
           });
 
+          const currentEq = eqMap[estoqueItem.unit];
           let conversionDone = false;
           for (const sibling of siblings) {
-            const siblingUnitVal = eqMap[sibling.unit];
-            if (!siblingUnitVal || siblingUnitVal <= currentUnitVal) continue; // deve ser unidade "maior"
-
-            const ratio = siblingUnitVal / currentUnitVal; // ex: 1 Unidade = 9 Doses → ratio=9
+            let ratio = null;
+            if (currentEq?.isFractional && currentEq?.fractionalValue > 1) {
+              // Unidade fracional (ex: Dose): 1 irmão-pai → fractionalValue doses
+              ratio = currentEq.fractionalValue;
+            } else {
+              // Unidade empacotada: comparar valores na tabela
+              const sibEq = eqMap[sibling.unit];
+              const currentVal = currentEq?.value || 1;
+              const sibVal = sibEq?.value || 1;
+              if (sibVal > currentVal) ratio = sibVal / currentVal;
+            }
+            if (!ratio || ratio <= 1) continue; // sem ratio válido, pular irmão
             const neededSiblings = Math.ceil(deficit / ratio);
 
             if (sibling.quantity < neededSiblings) continue; // irmã também sem estoque suficiente
@@ -2839,10 +2883,17 @@ app.get('/api/unit-equivalences', async (req, res) => {
 // POST /api/unit-equivalences - Criar nova equivalência
 app.post('/api/unit-equivalences', async (req, res) => {
   try {
-    const { unitName, value } = req.body;
-    
-    if (!unitName || value === undefined || value === null || parseFloat(value) < 0) {
-      return res.status(400).json({ error: 'Nome da unidade e valor são obrigatórios' });
+    const { unitName, value, isFractional, fractionalValue } = req.body;
+    const isPorcao = isFractional === true || isFractional === 'true';
+
+    if (!unitName) {
+      return res.status(400).json({ error: 'Nome da unidade é obrigatório' });
+    }
+    if (!isPorcao && (value === undefined || value === null || parseFloat(value) < 0)) {
+      return res.status(400).json({ error: 'Valor é obrigatório para unidades empacotadas' });
+    }
+    if (isPorcao && (!fractionalValue || parseFloat(fractionalValue) <= 1)) {
+      return res.status(400).json({ error: 'Informe quantas porções saem de 1 unidade-pai (deve ser > 1)' });
     }
 
     // Verificar se já existe equivalência para esta unidade
@@ -2857,7 +2908,9 @@ app.post('/api/unit-equivalences', async (req, res) => {
     const equivalence = await prisma.unitEquivalence.create({
       data: { 
         unitName, 
-        value: parseFloat(value) 
+        value: isPorcao ? 1 : parseFloat(value),
+        isFractional: isPorcao,
+        fractionalValue: isPorcao ? parseFloat(fractionalValue) : null
       }
     });
     
@@ -2872,15 +2925,23 @@ app.post('/api/unit-equivalences', async (req, res) => {
 app.put('/api/unit-equivalences/:unitName', async (req, res) => {
   try {
     const { unitName } = req.params;
-    const { value } = req.body;
-    
-    if (value === undefined || value === null || parseFloat(value) < 0) {
-      return res.status(400).json({ error: 'Valor é obrigatório e deve ser maior ou igual a zero' });
+    const { value, isFractional, fractionalValue } = req.body;
+    const isPorcao = isFractional === true || isFractional === 'true';
+
+    if (!isPorcao && (value === undefined || value === null || parseFloat(value) < 0)) {
+      return res.status(400).json({ error: 'Valor é obrigatório para unidades empacotadas' });
+    }
+    if (isPorcao && (!fractionalValue || parseFloat(fractionalValue) <= 1)) {
+      return res.status(400).json({ error: 'Informe quantas porções saem de 1 unidade-pai (deve ser > 1)' });
     }
 
     const equivalence = await prisma.unitEquivalence.update({
       where: { unitName },
-      data: { value: parseFloat(value) }
+      data: { 
+        value: isPorcao ? 1 : parseFloat(value),
+        isFractional: isPorcao,
+        fractionalValue: isPorcao ? parseFloat(fractionalValue) : null
+      }
     });
     
     res.json(equivalence);

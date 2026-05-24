@@ -146,7 +146,8 @@ model User {
   base_produto Boolean?
   pdv Boolean?
   pessoal Boolean?
-  auditoria Boolean?
+  auditoria Boolean?  
+  funcionario Boolean? @default(false)  
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -276,11 +277,13 @@ model StockMovement {
 }
 
 model UnitEquivalence {
-  id        Int      @id @default(autoincrement())
-  unitName  String   @unique
-  value     Float    // Quantas unidades representa (ex: 1 Maço = 20 Unidades)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id              Int      @id @default(autoincrement())
+  unitName        String   @unique
+  value           Float    // Quantas unidades representa (ex: 1 Maço = 20 Unidades)
+  isFractional    Boolean  @default(false)  // Indica que é uma unidade fracional (Dose, Taça, Copo...)
+  fractionalValue Float?   // Quantas dessas unidades saem de 1 unidade-pai (ex: 1 Unidade → 9 Doses)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 }
 
 model DespPessoal{
