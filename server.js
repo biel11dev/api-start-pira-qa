@@ -2398,7 +2398,6 @@ app.post('/api/sales', async (req, res) => {
       }
       if (estoqueItem.quantity < item.quantity) {
         // Verificar se há conversão automática possível a partir de unidade irmã
-        const currentUnitVal = eqMapCheck[estoqueItem.unit] || 1;
         const deficit = item.quantity - estoqueItem.quantity;
         const siblings = await prisma.estoque.findMany({
           where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
@@ -2687,7 +2686,7 @@ app.post('/api/sales', async (req, res) => {
       }
 
       return sale;
-    });
+    }, { timeout: 30000, maxWait: 30000 });
 
     // 5. Registrar entrada no caixa aberto (fora da transação para evitar isolamento)
     try {
