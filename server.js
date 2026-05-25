@@ -2724,6 +2724,17 @@ app.post('/api/sales', async (req, res) => {
     res.status(201).json(result);
   } catch (error) {
     console.error('Erro ao criar venda:', error);
+    // Se for erro de negócio (estoque, comanda, etc), retornar mensagem legível
+    const isBusinessError = error.message && (
+      error.message.includes('Estoque insuficiente') ||
+      error.message.includes('estoque') ||
+      error.message.includes('Limite') ||
+      error.message.includes('senha') ||
+      error.message.includes('não encontrado')
+    );
+    if (isBusinessError) {
+      return res.status(400).json({ error: error.message });
+    }
     res.status(500).json({ error: 'Erro interno do servidor', details: error.message });
   }
 });
