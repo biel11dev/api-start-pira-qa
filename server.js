@@ -3894,6 +3894,23 @@ app.post("/api/pdv-caixa-movimento", async (req, res) => {
       include: { origens: true },
     });
 
+    // Registrar no sub-caixa aberto (se houver)
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+    if (caixaAberto) {
+      const descOrigens = (origens || []).filter(o => o.nome).map(o => `${o.nome} (R$ ${parseFloat(o.valor).toFixed(2)})`).join(", ");
+      await prisma.pdvCaixaTransacao.create({
+        data: {
+          caixaId: caixaAberto.id,
+          tipo: "ENTRADA",
+          categoria: "ADD",
+          valor: parseFloat(valor),
+          descricao: [descOrigens, observacao].filter(Boolean).join(" | ") || "Adição de dinheiro ao caixa",
+          userId,
+          userName,
+        },
+      });
+    }
+
     res.status(201).json(movimento);
   } catch (error) {
     console.error("Erro ao registrar movimentação:", error);
@@ -3978,6 +3995,23 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
           DespesaFixa: false,
           tipoMovimento: "GANHO",
           isVale: true,
+        },
+      });
+    }
+
+    // Registrar no sub-caixa aberto (se houver)
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+    if (caixaAberto) {
+      const descOrigens = origensPreenchidas.map(o => `${o.nome} (R$ ${parseFloat(o.valor).toFixed(2)})`).join(", ");
+      await prisma.pdvCaixaTransacao.create({
+        data: {
+          caixaId: caixaAberto.id,
+          tipo: "SAIDA",
+          categoria: "VALE",
+          valor: parseFloat(valor),
+          descricao: [descOrigens, observacao].filter(Boolean).join(" | ") || "Vale / Sangria",
+          userId,
+          userName,
         },
       });
     }
@@ -4081,6 +4115,23 @@ app.post("/api/pdv-premio", async (req, res) => {
       },
       include: { origens: true },
     });
+
+    // Registrar no sub-caixa aberto (se houver)
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+    if (caixaAberto) {
+      const descOrigens = origensPreenchidas.map(o => `${o.nome} (R$ ${parseFloat(o.valor).toFixed(2)})`).join(", ");
+      await prisma.pdvCaixaTransacao.create({
+        data: {
+          caixaId: caixaAberto.id,
+          tipo: "SAIDA",
+          categoria: "PREMIO",
+          valor: parseFloat(valor),
+          descricao: [descOrigens, observacao].filter(Boolean).join(" | ") || "Prêmio de máquina",
+          userId,
+          userName,
+        },
+      });
+    }
 
     res.status(201).json(premio);
   } catch (error) {
