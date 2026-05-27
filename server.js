@@ -164,7 +164,7 @@ async function sendResetEmail(email, token) {
     },
   });
 
-  const resetLink = `https://start-pira-ftd.vercel.app/reset-password?token=${token}`;
+  const resetLink = `https://start-pira-qa.vercel.app/reset-password?token=${token}`;
 
   const mailOptions = {
     from: '"Start Pira" <startpira01@gmail.com>',
