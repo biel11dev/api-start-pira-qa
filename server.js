@@ -2742,15 +2742,21 @@ app.post('/api/sales', async (req, res) => {
 // Rota para buscar vendas
 app.get('/api/sales', async (req, res) => {
   try {
-    const sales = await prisma.sale.findMany({
-      include: {
-        items: true
-      },
-      orderBy: {
-        date: 'desc'
+    const { dataInicio, dataFim } = req.query;
+    const where = {};
+    if (dataInicio || dataFim) {
+      where.date = {};
+      if (dataInicio) where.date.gte = new Date(dataInicio + 'T00:00:00');
+      if (dataFim) {
+        const fim = new Date(dataFim + 'T23:59:59');
+        where.date.lte = fim;
       }
+    }
+    const sales = await prisma.sale.findMany({
+      where,
+      include: { items: true },
+      orderBy: { date: 'desc' },
     });
-    
     res.json(sales);
   } catch (error) {
     console.error('Erro ao buscar vendas:', error);
