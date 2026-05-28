@@ -109,12 +109,14 @@ model Estoque {
   updatedAt  DateTime? @updatedAt
   value      Float
   valuecusto Float
+  contabiliza Boolean  @default(true) // false = descartável (não baixa estoque; usa FollowUp)
   stockMovements StockMovement[]
   saleItems      SaleItem[]
   composicoes    ComposicaoProduto[]
   composicaoOpcoes ComposicaoOpcao[]
   estoqueMinimo  EstoqueMinimo?
   listaCompras   ListaCompras[]
+  followUps      FollowUp[]
 
   @@index([productId])
 }
@@ -585,4 +587,23 @@ model ListaCompras {
 
   @@index([estoqueId])
   @@index([status])
+}
+
+model FollowUp {
+  id            Int      @id @default(autoincrement())
+  estoqueId     Int
+  estoque       Estoque  @relation(fields: [estoqueId], references: [id], onDelete: Cascade)
+  semana        String   // "YYYY-Www" – identificador da semana ISO
+  temEstoque    Boolean? // null = pendente resposta, true = sim, false = não
+  quantidade    Float?   // quantidade informada pelo usuário (se temEstoque=true)
+  observacao    String?
+  respondidoEm  DateTime?
+  respondidoPor String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([estoqueId, semana])
+  @@index([estoqueId])
+  @@index([semana])
+  @@index([temEstoque])
 }

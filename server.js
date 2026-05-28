@@ -817,6 +817,133 @@ app.put("/api/lista-compras/:id/reabrir", async (req, res) => {
   }
 });
 
+// ============================================================
+// HELPERS: ListaCompras e FollowUp
+// ============================================================
+
+// Retorna a semana ISO no formato "YYYY-Www"
+function getISOWeekString(date = new Date()) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + 3 - ((d.getDay() + 6) % 7));
+  const week1 = new Date(d.getFullYear(), 0, 4);
+  const weekNum = 1 + Math.round(((d - week1) / 86400000 - 3 + ((week1.getDay() + 6) % 7)) / 7);
+  return `${d.getFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+}
+
+// Verifica se o estoque atingiu o mínimo e cria/atualiza a ListaCompras
+async function criarListaComprasSeNecessario(estoqueId, novaQuantidade) {
+  try {
+    const minimo = await prisma.estoqueMinimo.findUnique({ where: { estoqueId } });
+    if (!minimo) return;
+    const estoque = await prisma.estoque.findUnique({ where: { id: estoqueId }, select: { name: true } });
+    if (!estoque) return;
+    if (novaQuantidade <= minimo.quantidadeMinima) {
+      const pendente = await prisma.listaCompras.findFirst({ where: { estoqueId, status: "PENDENTE" } });
+      if (pendente) {
+        await prisma.listaCompras.update({ where: { id: pendente.id }, data: { quantidadeAtual: novaQuantidade } });
+      } else {
+        await prisma.listaCompras.create({
+          data: { estoqueId, nomeProduto: estoque.name, quantidadeAtual: novaQuantidade, quantidadeMinima: minimo.quantidadeMinima, status: "PENDENTE" }
+        });
+      }
+    } else {
+      const pendente = await prisma.listaCompras.findFirst({ where: { estoqueId, status: "PENDENTE" } });
+      if (pendente) {
+        await prisma.listaCompras.update({ where: { id: pendente.id }, data: { status: "CONCLUIDO", concluidoEm: new Date() } });
+      }
+    }
+  } catch (err) {
+    console.error("Erro ao verificar lista de compras:", err.message);
+  }
+}
+
+// ============================================================
+// FOLLOW-UP
+// ============================================================
+
+// Gerar follow-ups da semana atual para todos os itens com contabiliza=false
+app.post("/api/followup/gerar-semana", async (req, res) => {
+  try {
+    const semana = getISOWeekString();
+    const itens = await prisma.estoque.findMany({ where: { contabiliza: false }, select: { id: true } });
+    const criados = [];
+    for (const item of itens) {
+      try {
+        const fu = await prisma.followUp.upsert({
+          where: { estoqueId_semana: { estoqueId: item.id, semana } },
+          update: {},
+          create: { estoqueId: item.id, semana },
+        });
+        criados.push(fu);
+      } catch (_) {}
+    }
+    res.json({ semana, total: criados.length });
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao gerar follow-ups", details: e.message });
+  }
+});
+
+// Buscar follow-ups pendentes da semana atual
+app.get("/api/followup/pendentes", async (req, res) => {
+  try {
+    const semana = getISOWeekString();
+    const pendentes = await prisma.followUp.findMany({
+      where: { semana, temEstoque: null },
+      include: { estoque: { select: { id: true, name: true, unit: true, quantity: true } } },
+      orderBy: { createdAt: "asc" }
+    });
+    res.json(pendentes);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao buscar pendentes", details: e.message });
+  }
+});
+
+// Responder um follow-up
+app.put("/api/followup/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { temEstoque, quantidade, observacao, respondidoPor } = req.body;
+    const fu = await prisma.followUp.update({
+      where: { id },
+      data: {
+        temEstoque: typeof temEstoque === "boolean" ? temEstoque : null,
+        quantidade: quantidade != null ? parseFloat(quantidade) : null,
+        observacao: observacao || null,
+        respondidoEm: new Date(),
+        respondidoPor: respondidoPor || null,
+      },
+      include: { estoque: { select: { id: true, name: true, unit: true, quantity: true } } }
+    });
+
+    // Se informou quantidade, atualizar o estoque e checar mínimo
+    if (temEstoque === true && quantidade != null) {
+      const novaQtd = parseFloat(quantidade);
+      await prisma.estoque.update({ where: { id: fu.estoqueId }, data: { quantity: novaQtd } });
+      await criarListaComprasSeNecessario(fu.estoqueId, novaQtd);
+    }
+
+    res.json(fu);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao responder follow-up", details: e.message });
+  }
+});
+
+// Histórico de follow-ups de um item
+app.get("/api/followup/historico/:estoqueId", async (req, res) => {
+  try {
+    const estoqueId = parseInt(req.params.estoqueId);
+    const historico = await prisma.followUp.findMany({
+      where: { estoqueId },
+      orderBy: { semana: "desc" },
+      take: 52
+    });
+    res.json(historico);
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao buscar histórico", details: e.message });
+  }
+});
+
 // Conversão de unidades - ex: 1 Fardo (12un) → 12 Unidades
 app.post("/api/estoque_prod/converter", async (req, res) => {
   try {
@@ -1236,7 +1363,7 @@ app.post("/api/estoque_prod", async (req, res) => {
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, contabiliza } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1265,7 +1392,8 @@ app.put("/api/estoque_prod/:id", async (req, res) => {
         unit, 
         value: parsedValue, 
         valuecusto: parsedValueCusto,
-        categoria_Id: categoryId ? parseInt(categoryId) : null
+        categoria_Id: categoryId ? parseInt(categoryId) : null,
+        ...(contabiliza !== undefined ? { contabiliza: Boolean(contabiliza) } : {})
       },
       include: {
         product: true,
@@ -2396,6 +2524,8 @@ app.post('/api/sales', async (req, res) => {
       if (!estoqueItem) {
         return res.status(400).json({ error: `Produto "${item.name}" não encontrado no estoque.` });
       }
+      // Itens com contabiliza=false não precisam de verificação de estoque
+      if (estoqueItem.contabiliza === false) continue;
       if (estoqueItem.quantity < item.quantity) {
         // Verificar se há conversão automática possível a partir de unidade irmã
         const deficit = item.quantity - estoqueItem.quantity;
@@ -2504,6 +2634,11 @@ app.post('/api/sales', async (req, res) => {
         // Re-verificar estoque dentro da transação (proteção contra race condition)
         let estoqueItem = await tx.estoque.findUnique({ where: { id: item.id } });
         let currentStock = estoqueItem.quantity;
+
+        // Itens com contabiliza=false NÃO baixam estoque automaticamente (follow-up semanal)
+        if (estoqueItem.contabiliza === false) {
+          continue; // pular atualização de estoque para descartáveis
+        }
 
         // Se estoque insuficiente, tentar conversão automática de unidade irmã
         if (currentStock < item.quantity) {
@@ -2719,6 +2854,18 @@ app.post('/api/sales', async (req, res) => {
       }
     } catch (caixaErr) {
       console.error("Erro ao registrar transação no caixa (não crítico):", caixaErr.message);
+    }
+
+    // 6. Verificar estoque mínimo e atualizar ListaCompras para itens que baixaram estoque
+    try {
+      for (const item of items) {
+        const estoqueItem = await prisma.estoque.findUnique({ where: { id: item.id }, select: { quantity: true, contabiliza: true } });
+        if (estoqueItem && estoqueItem.contabiliza !== false) {
+          await criarListaComprasSeNecessario(item.id, estoqueItem.quantity);
+        }
+      }
+    } catch (lcErr) {
+      console.error("Erro ao verificar lista de compras (não crítico):", lcErr.message);
     }
 
     res.status(201).json(result);
