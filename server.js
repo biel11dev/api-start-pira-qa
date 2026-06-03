@@ -832,7 +832,7 @@ function getISOWeekString(date = new Date()) {
 }
 
 // Verifica se o estoque atingiu o mínimo e cria/atualiza a ListaCompras
-async function criarListaComprasSeNecessario(estoqueId, novaQuantidade) {
+async function    criarListaComprasSeNecessario(estoqueId, novaQuantidade) {
   try {
     const minimo = await prisma.estoqueMinimo.findUnique({ where: { estoqueId } });
     if (!minimo) return;
@@ -916,12 +916,34 @@ app.put("/api/followup/:id", async (req, res) => {
       include: { estoque: { select: { id: true, name: true, unit: true, quantity: true } } }
     });
 
-    // Se informou quantidade, atualizar o estoque e checar mínimo
+       // Se SIM: atualizar estoque com a quantidade informada e checar mínimo
     if (temEstoque === true && quantidade != null) {
       const novaQtd = parseFloat(quantidade);
       await prisma.estoque.update({ where: { id: fu.estoqueId }, data: { quantity: novaQtd } });
       await criarListaComprasSeNecessario(fu.estoqueId, novaQtd);
     }
+
+    // Se NÃO: zerar estoque e sempre garantir entrada na lista de compras (incondicional)
+    if (temEstoque === false) {
+      await prisma.estoque.update({ where: { id: fu.estoqueId }, data: { quantity: 0 } });
+      const estoqueInfo = await prisma.estoque.findUnique({ where: { id: fu.estoqueId }, select: { name: true } });
+      const minimoInfo = await prisma.estoqueMinimo.findUnique({ where: { estoqueId: fu.estoqueId } });
+      const pendente = await prisma.listaCompras.findFirst({ where: { estoqueId: fu.estoqueId, status: "PENDENTE" } });
+      if (pendente) {
+        await prisma.listaCompras.update({ where: { id: pendente.id }, data: { quantidadeAtual: 0 } });
+      } else if (estoqueInfo) {
+        await prisma.listaCompras.create({
+          data: {
+            estoqueId: fu.estoqueId,
+            nomeProduto: estoqueInfo.name,
+            quantidadeAtual: 0,
+            quantidadeMinima: minimoInfo?.quantidadeMinima || 0,
+            status: "PENDENTE",
+          },
+        });
+      }
+    }
+
 
     res.json(fu);
   } catch (e) {
