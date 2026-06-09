@@ -4823,10 +4823,12 @@ app.get("/api/pdv-caixa-controle/atual", async (req, res) => {
       // Calcular saldo atual
       const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
       const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
+      // ADD é reforço do caixa (não é receita): calculado separadamente para o display
+      const totalAdd = caixaAberto.transacoes.filter(t => t.categoria === "ADD").reduce((s, t) => s + t.valor, 0);
       // saldoInicial já está incluído como transação ABERTURA (ENTRADA), não somar duas vezes
       const saldoAtual = entradas - saidas;
       const horasAberto = (new Date() - new Date(caixaAberto.abertoEm)) / (1000 * 60 * 60);
-      return res.json({ ...caixaAberto, saldoAtual, totalEntradas: entradas, totalSaidas: saidas, horasAberto });
+      return res.json({ ...caixaAberto, saldoAtual, totalEntradas: entradas, totalSaidas: saidas, totalAdd, horasAberto });
     }
     // Se não há caixa aberto, retorna o último fechado
     const ultimoFechado = await prisma.pdvCaixaControle.findFirst({
@@ -4836,6 +4838,57 @@ app.get("/api/pdv-caixa-controle/atual", async (req, res) => {
     res.json({ caixaAberto: null, ultimoFechado });
   } catch (error) {
     res.status(500).json({ error: "Erro ao buscar caixa atual", details: error.message });
+  }
+});
+
+// Saque (troco via máquina): registra SAIDA do valor em dinheiro no sub-caixa
+app.post("/api/pdv-saque", async (req, res) => {
+  try {
+    const { valor, observacao } = req.body;
+    if (!valor || parseFloat(valor) <= 0) {
+      return res.status(400).json({ error: "Valor inválido para saque." });
+    }
+    const valorNum = parseFloat(valor);
+
+    // Extrair operador do token
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+    if (!caixaAberto) {
+      return res.status(400).json({ error: "Nenhum caixa aberto. Abra o caixa antes de realizar um saque." });
+    }
+
+    const maquinaValor = (valorNum * 1.3).toFixed(2);
+    const descricao = observacao
+      ? `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor}) — ${observacao}`
+      : `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor})`;
+
+    const transacao = await prisma.pdvCaixaTransacao.create({
+      data: {
+        caixaId: caixaAberto.id,
+        tipo: "SAIDA",
+        categoria: "SAQUE",
+        valor: valorNum,
+        descricao,
+        userId,
+        userName,
+      },
+    });
+
+    res.status(201).json({ transacao, maquinaValor: parseFloat(maquinaValor) });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao registrar saque", details: error.message });
   }
 });
 
