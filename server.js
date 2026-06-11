@@ -50,7 +50,7 @@ const rotaParaModulo = (rota) => {
   if (rota.includes("/api/balance")) return "caixa";
   if (rota.includes("/api/sales")) return "pdv";
   if (rota.includes("/api/estoque")) return "pdv";
-  if (rota.includes("/api/pdv-caixa") || rota.includes("/api/pdv-origens")) return "pdv";
+  if (rota.includes("/api/pdv-caixa") || rota.includes("/api/pdv-origens") || rota.includes("/api/pdv-origem-saldo")) return "pdv";
   if (rota.includes("/api/products")) return "produtos";
   if (rota.includes("/api/categories")) return "estoque";
   if (rota.includes("/api/unit-equivalences")) return "estoque";
@@ -832,7 +832,7 @@ function getISOWeekString(date = new Date()) {
 }
 
 // Verifica se o estoque atingiu o mínimo e cria/atualiza a ListaCompras
-async function    criarListaComprasSeNecessario(estoqueId, novaQuantidade) {
+async function criarListaComprasSeNecessario(estoqueId, novaQuantidade) {
   try {
     const minimo = await prisma.estoqueMinimo.findUnique({ where: { estoqueId } });
     if (!minimo) return;
@@ -916,7 +916,7 @@ app.put("/api/followup/:id", async (req, res) => {
       include: { estoque: { select: { id: true, name: true, unit: true, quantity: true } } }
     });
 
-       // Se SIM: atualizar estoque com a quantidade informada e checar mínimo
+         // Se SIM: atualizar estoque com a quantidade informada e checar mínimo
     if (temEstoque === true && quantidade != null) {
       const novaQtd = parseFloat(quantidade);
       await prisma.estoque.update({ where: { id: fu.estoqueId }, data: { quantity: novaQtd } });
@@ -4242,6 +4242,185 @@ app.post("/api/pdv-origens/init", async (req, res) => {
     res.json(results);
   } catch (error) {
     res.status(500).json({ error: "Erro ao inicializar origens", details: error.message });
+  }
+});
+
+// ===================== ROTAS DE SALDO POR ORIGEM (BAG / MÁQUINA / CAIXA) =====================
+
+// Buscar saldos de todas as origens
+app.get("/api/pdv-origem-saldo", async (req, res) => {
+  try {
+    const origens = await prisma.pdvOrigemSaldo.findMany({
+      orderBy: { nome: "asc" },
+    });
+    res.json(origens);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar saldos", details: error.message });
+  }
+});
+
+// Inicializar as 3 origens padrão (idempotente)
+app.post("/api/pdv-origem-saldo/init", async (req, res) => {
+  try {
+    const origensDefault = ["BAG", "MÁQUINA", "CAIXA"];
+    const results = [];
+    for (const nome of origensDefault) {
+      const o = await prisma.pdvOrigemSaldo.upsert({
+        where: { nome },
+        update: {},
+        create: { nome, saldo: 0 },
+      });
+      results.push(o);
+    }
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao inicializar origens de saldo", details: error.message });
+  }
+});
+
+// Ajustar saldo de uma origem (ENTRADA, SAIDA ou AJUSTE direto)
+app.post("/api/pdv-origem-saldo/:nome/movimentar", async (req, res) => {
+  try {
+    const { nome } = req.params;
+    const { tipo, valor, descricao } = req.body;
+
+    if (!tipo || !["ENTRADA", "SAIDA", "AJUSTE"].includes(tipo)) {
+      return res.status(400).json({ error: "Tipo inválido. Use ENTRADA, SAIDA ou AJUSTE." });
+    }
+    const valorNum = parseFloat(valor);
+    if (isNaN(valorNum) || valorNum <= 0) {
+      return res.status(400).json({ error: "Valor inválido." });
+    }
+
+    // Extrair operador do token
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const origem = await prisma.pdvOrigemSaldo.findUnique({ where: { nome } });
+    if (!origem) {
+      return res.status(404).json({ error: `Origem "${nome}" não encontrada.` });
+    }
+
+    const saldoAntes = origem.saldo;
+    let saldoDepois;
+    if (tipo === "ENTRADA") saldoDepois = saldoAntes + valorNum;
+    else if (tipo === "SAIDA") saldoDepois = saldoAntes - valorNum;
+    else saldoDepois = valorNum; // AJUSTE = define diretamente
+
+    const result = await prisma.$transaction(async (tx) => {
+      const origemAtualizada = await tx.pdvOrigemSaldo.update({
+        where: { nome },
+        data: { saldo: saldoDepois },
+      });
+      const mov = await tx.pdvOrigemSaldoMovimento.create({
+        data: {
+          origemId: origem.id,
+          tipo,
+          valor: valorNum,
+          saldoAntes,
+          saldoDepois,
+          descricao: descricao || null,
+          userId,
+          userName,
+        },
+      });
+      return { origem: origemAtualizada, movimento: mov };
+    });
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao movimentar origem", details: error.message });
+  }
+});
+
+// Transferir valor entre duas origens
+app.post("/api/pdv-origem-saldo/transferir", async (req, res) => {
+  try {
+    const { origem: nomeOrigem, destino: nomeDestino, valor, descricao } = req.body;
+
+    if (!nomeOrigem || !nomeDestino || nomeOrigem === nomeDestino) {
+      return res.status(400).json({ error: "Origem e destino devem ser diferentes e informados." });
+    }
+    const valorNum = parseFloat(valor);
+    if (isNaN(valorNum) || valorNum <= 0) {
+      return res.status(400).json({ error: "Valor inválido." });
+    }
+
+    let userId = null;
+    let userName = null;
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        userId = decoded.userId;
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        userName = user?.name || user?.username || null;
+      }
+    } catch (e) { /* ignora */ }
+
+    const [fromOrigem, toOrigem] = await Promise.all([
+      prisma.pdvOrigemSaldo.findUnique({ where: { nome: nomeOrigem } }),
+      prisma.pdvOrigemSaldo.findUnique({ where: { nome: nomeDestino } }),
+    ]);
+    if (!fromOrigem) return res.status(404).json({ error: `Origem "${nomeOrigem}" não encontrada.` });
+    if (!toOrigem) return res.status(404).json({ error: `Destino "${nomeDestino}" não encontrado.` });
+    if (fromOrigem.saldo < valorNum) {
+      return res.status(400).json({ error: `Saldo insuficiente em "${nomeOrigem}". Disponível: R$ ${fromOrigem.saldo.toFixed(2)}.` });
+    }
+
+    const novoSaldoFrom = fromOrigem.saldo - valorNum;
+    const novoSaldoTo = toOrigem.saldo + valorNum;
+    const desc = descricao || `Transferência de ${nomeOrigem} → ${nomeDestino}`;
+
+    const result = await prisma.$transaction(async (tx) => {
+      const [from, to] = await Promise.all([
+        tx.pdvOrigemSaldo.update({ where: { nome: nomeOrigem }, data: { saldo: novoSaldoFrom } }),
+        tx.pdvOrigemSaldo.update({ where: { nome: nomeDestino }, data: { saldo: novoSaldoTo } }),
+      ]);
+      await Promise.all([
+        tx.pdvOrigemSaldoMovimento.create({
+          data: { origemId: fromOrigem.id, tipo: "SAIDA", valor: valorNum, saldoAntes: fromOrigem.saldo, saldoDepois: novoSaldoFrom, descricao: desc, userId, userName },
+        }),
+        tx.pdvOrigemSaldoMovimento.create({
+          data: { origemId: toOrigem.id, tipo: "ENTRADA", valor: valorNum, saldoAntes: toOrigem.saldo, saldoDepois: novoSaldoTo, descricao: desc, userId, userName },
+        }),
+      ]);
+      return { from, to };
+    });
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao transferir entre origens", details: error.message });
+  }
+});
+
+// Histórico de movimentos de uma origem
+app.get("/api/pdv-origem-saldo/:nome/historico", async (req, res) => {
+  try {
+    const { nome } = req.params;
+    const { limit = 50 } = req.query;
+    const origem = await prisma.pdvOrigemSaldo.findUnique({ where: { nome } });
+    if (!origem) return res.status(404).json({ error: `Origem "${nome}" não encontrada.` });
+
+    const movimentos = await prisma.pdvOrigemSaldoMovimento.findMany({
+      where: { origemId: origem.id },
+      orderBy: { createdAt: "desc" },
+      take: parseInt(limit),
+    });
+    res.json({ origem, movimentos });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar histórico", details: error.message });
   }
 });
 

@@ -607,3 +607,34 @@ model FollowUp {
   @@index([semana])
   @@index([temEstoque])
 }
+
+// ===== ORIGENS DE SALDO (BAG, MÁQUINA, CAIXA) =====
+
+model PdvOrigemSaldo {
+  id        Int      @id @default(autoincrement())
+  nome      String   @unique  // "BAG", "MÁQUINA", "CAIXA"
+  saldo     Float    @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  movimentos PdvOrigemSaldoMovimento[]
+
+  @@index([nome])
+}
+
+model PdvOrigemSaldoMovimento {
+  id          Int            @id @default(autoincrement())
+  origemId    Int
+  origem      PdvOrigemSaldo @relation(fields: [origemId], references: [id], onDelete: Cascade)
+  tipo        String         // "ENTRADA" | "SAIDA" | "AJUSTE"
+  valor       Float          // valor positivo sempre; tipo determina direção
+  saldoAntes  Float
+  saldoDepois Float
+  descricao   String?
+  userId      Int?
+  userName    String?
+  createdAt   DateTime @default(now())
+
+  @@index([origemId])
+  @@index([createdAt])
+}
