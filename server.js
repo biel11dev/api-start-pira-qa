@@ -4086,6 +4086,29 @@ app.post("/api/pdv-caixa-movimento", async (req, res) => {
       });
     }
 
+    // Descontar de cada origem de saldo (BAG / MÁQUINA / CAIXA) quando informada
+    const ORIGENS_VALIDAS = ["BAG", "MÁQUINA", "CAIXA"];
+    for (const og of (origens || []).filter(o => ORIGENS_VALIDAS.includes(o.nome) && parseFloat(o.valor) > 0)) {
+      try {
+        const origemReg = await prisma.pdvOrigemSaldo.findUnique({ where: { nome: og.nome } });
+        if (origemReg) {
+          const saldoAntes = origemReg.saldo;
+          const saldoDepois = saldoAntes - parseFloat(og.valor);
+          await prisma.$transaction([
+            prisma.pdvOrigemSaldo.update({ where: { nome: og.nome }, data: { saldo: saldoDepois } }),
+            prisma.pdvOrigemSaldoMovimento.create({
+              data: {
+                origemId: origemReg.id, tipo: "SAIDA", valor: parseFloat(og.valor),
+                saldoAntes, saldoDepois,
+                descricao: `ADD - ${observacao || "Adição ao caixa"}`,
+                userId, userName,
+              },
+            }),
+          ]);
+        }
+      } catch (e) { console.error("Erro ao descontar origem (ADD):", e.message); }
+    }
+
     res.status(201).json(movimento);
   } catch (error) {
     console.error("Erro ao registrar movimentação:", error);
@@ -4189,6 +4212,29 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
           userName,
         },
       });
+    }
+
+    // Descontar de cada origem de saldo (BAG / MÁQUINA / CAIXA) quando informada
+    const ORIGENS_VALIDAS_VALE = ["BAG", "MÁQUINA", "CAIXA"];
+    for (const og of origensPreenchidas.filter(o => ORIGENS_VALIDAS_VALE.includes(o.nome))) {
+      try {
+        const origemReg = await prisma.pdvOrigemSaldo.findUnique({ where: { nome: og.nome } });
+        if (origemReg) {
+          const saldoAntes = origemReg.saldo;
+          const saldoDepois = saldoAntes - parseFloat(og.valor);
+          await prisma.$transaction([
+            prisma.pdvOrigemSaldo.update({ where: { nome: og.nome }, data: { saldo: saldoDepois } }),
+            prisma.pdvOrigemSaldoMovimento.create({
+              data: {
+                origemId: origemReg.id, tipo: "SAIDA", valor: parseFloat(og.valor),
+                saldoAntes, saldoDepois,
+                descricao: `VALE - ${observacao || "Vale / Sangria"}`,
+                userId, userName,
+              },
+            }),
+          ]);
+        }
+      } catch (e) { console.error("Erro ao descontar origem (VALE):", e.message); }
     }
 
     res.status(201).json({ movimento, despesaPessoal, isAdmin });
