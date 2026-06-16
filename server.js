@@ -4338,7 +4338,8 @@ app.get("/api/pdv-origem-saldo", async (req, res) => {
         if (caixaAberto) {
           const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
           const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
-          const saldoAtual = parseFloat((caixaAberto.saldoInicial + entradas - saidas).toFixed(2));
+          // saldoInicial já está incluído como transação ABERTURA (ENTRADA), não somar duas vezes
+          const saldoAtual = parseFloat((entradas - saidas).toFixed(2));
           return { ...o, saldo: saldoAtual };
         } else {
           return { ...o, saldo: 0 };
@@ -5327,7 +5328,8 @@ app.put("/api/pdv-caixa-controle/fechar", async (req, res) => {
 
     const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
     const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
-    const saldoFinal = caixaAberto.saldoInicial + entradas - saidas;
+    // saldoInicial já está incluído como transação ABERTURA (ENTRADA), não somar duas vezes
+    const saldoFinal = entradas - saidas;
     const fechadoEm = new Date();
 
     // Helpers de integração com Caixa Principal
