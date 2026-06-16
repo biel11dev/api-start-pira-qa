@@ -1658,7 +1658,23 @@ app.post("/api/balances", async (req, res) => {
 });
 
 app.put("/api/balances/:id", async (req, res) => {
-  res.json(await prisma.balance.update({ where: { id: parseInt(req.params.id) }, data: req.body }));
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: "ID inválido" });
+
+    const vinculo = await prisma.pdvCaixaControle.findFirst({ where: { balanceId: id } });
+    if (vinculo) {
+      return res.status(409).json({
+        error: "Este registro está vinculado a um caixa fechado. Contate um administrador para realizar alterações.",
+        caixaId: vinculo.id,
+        fechadoEm: vinculo.fechadoEm,
+      });
+    }
+
+    res.json(await prisma.balance.update({ where: { id }, data: req.body }));
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao atualizar saldo", details: error.message });
+  }
 });
 
 app.delete("/api/balances/:id", async (req, res) => {
@@ -1666,6 +1682,17 @@ app.delete("/api/balances/:id", async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) {
       return res.status(400).json({ error: "ID inválido" });
+    }
+
+    // Verificar se existe sub-caixa fechado vinculado a este Balance
+    const vinculo = await prisma.pdvCaixaControle.findFirst({ where: { balanceId: id } });
+    if (vinculo) {
+      return res.status(409).json({
+        error: "Este caixa está fechado e vinculado a um fechamento de turno. Não é possível excluí-lo. Contate um administrador.",
+        caixaId: vinculo.id,
+        fechadoEm: vinculo.fechadoEm,
+        fechadoPorNome: vinculo.fechadoPorNome,
+      });
     }
 
     await prisma.balance.delete({ where: { id } });
@@ -5415,8 +5442,18 @@ app.put("/api/pdv-caixa-controle/fechar", async (req, res) => {
         where: { id: balanceExistente.id },
         data: payloadBalance,
       });
+      // Vincular sub-caixa ao Balance existente
+      await prisma.pdvCaixaControle.update({
+        where: { id: caixaFechado.id },
+        data: { balanceId: balanceExistente.id },
+      });
     } else {
-      await prisma.balance.create({ data: payloadBalance });
+      const novoBalance = await prisma.balance.create({ data: payloadBalance });
+      // Vincular sub-caixa ao novo Balance
+      await prisma.pdvCaixaControle.update({
+        where: { id: caixaFechado.id },
+        data: { balanceId: novoBalance.id },
+      });
     }
 
     res.json(caixaFechado);

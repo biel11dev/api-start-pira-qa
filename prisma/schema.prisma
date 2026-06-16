@@ -19,6 +19,7 @@ model Balance {
   dinheirofimcaixa Float?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime?
+  subCaixas        PdvCaixaControle[]
 }
 
 model Client {
@@ -486,12 +487,15 @@ model PdvCaixaControle {
   fechadoPorNome  String?
   abertoEm        DateTime  @default(now())
   fechadoEm       DateTime?
+  balanceId       Int?      // FK para o registro Balance gerado no fechamento
+  balance         Balance?  @relation(fields: [balanceId], references: [id], onDelete: Restrict)
   transacoes      PdvCaixaTransacao[]
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
   @@index([status])
   @@index([abertoEm])
+  @@index([balanceId])
 }
 
 model PdvCaixaTransacao {
