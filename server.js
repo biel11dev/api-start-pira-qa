@@ -4299,7 +4299,28 @@ app.get("/api/pdv-origem-saldo", async (req, res) => {
     const origens = await prisma.pdvOrigemSaldo.findMany({
       orderBy: { nome: "asc" },
     });
-    res.json(origens);
+
+    // Sincronizar origem "CAIXA" com o saldo real do caixa aberto
+    const caixaAberto = await prisma.pdvCaixaControle.findFirst({
+      where: { status: "ABERTO" },
+      include: { transacoes: true },
+    });
+
+    const result = origens.map(o => {
+      if (o.nome === "CAIXA") {
+        if (caixaAberto) {
+          const entradas = caixaAberto.transacoes.filter(t => t.tipo === "ENTRADA").reduce((s, t) => s + t.valor, 0);
+          const saidas = caixaAberto.transacoes.filter(t => t.tipo === "SAIDA").reduce((s, t) => s + t.valor, 0);
+          const saldoAtual = parseFloat((caixaAberto.saldoInicial + entradas - saidas).toFixed(2));
+          return { ...o, saldo: saldoAtual };
+        } else {
+          return { ...o, saldo: 0 };
+        }
+      }
+      return o;
+    });
+
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: "Erro ao buscar saldos", details: error.message });
   }
@@ -5067,6 +5088,35 @@ app.get("/api/pdv-caixa-controle/atual", async (req, res) => {
 });
 
 // Saque (troco via máquina): registra SAIDA do valor em dinheiro no sub-caixa
+// Taxa de saque — GET e PUT
+app.get("/api/pdv-saque/config", async (req, res) => {
+  try {
+    const config = await prisma.pdvConfigVenda.findUnique({ where: { chave: "taxa_saque_percentual" } });
+    const taxa = config ? parseFloat(config.valor) : 30;
+    res.json({ taxa });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar taxa de saque", details: error.message });
+  }
+});
+
+app.put("/api/pdv-saque/config", async (req, res) => {
+  try {
+    const { taxa } = req.body;
+    const taxaNum = parseFloat(taxa);
+    if (isNaN(taxaNum) || taxaNum < 0 || taxaNum > 100) {
+      return res.status(400).json({ error: "Taxa inválida. Informe um percentual entre 0 e 100." });
+    }
+    const config = await prisma.pdvConfigVenda.upsert({
+      where: { chave: "taxa_saque_percentual" },
+      update: { valor: String(taxaNum) },
+      create: { chave: "taxa_saque_percentual", valor: String(taxaNum), descricao: "Taxa percentual cobrada na máquina para saques (%)" },
+    });
+    res.json({ taxa: parseFloat(config.valor) });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao salvar taxa de saque", details: error.message });
+  }
+});
+
 app.post("/api/pdv-saque", async (req, res) => {
   try {
     const { valor, observacao } = req.body;
@@ -5094,10 +5144,14 @@ app.post("/api/pdv-saque", async (req, res) => {
       return res.status(400).json({ error: "Nenhum caixa aberto. Abra o caixa antes de realizar um saque." });
     }
 
-    const maquinaValor = (valorNum * 1.3).toFixed(2);
+    // Buscar taxa configurada (default 30%)
+    const taxaConfig = await prisma.pdvConfigVenda.findUnique({ where: { chave: "taxa_saque_percentual" } });
+    const taxaPerc = taxaConfig ? parseFloat(taxaConfig.valor) : 30;
+    const multiplicador = 1 + taxaPerc / 100;
+    const maquinaValor = (valorNum * multiplicador).toFixed(2);
     const descricao = observacao
-      ? `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor}) — ${observacao}`
-      : `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor})`;
+      ? `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor}, taxa ${taxaPerc}%) — ${observacao}`
+      : `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor}, taxa ${taxaPerc}%)`;
 
     const transacao = await prisma.pdvCaixaTransacao.create({
       data: {
@@ -5111,7 +5165,7 @@ app.post("/api/pdv-saque", async (req, res) => {
       },
     });
 
-    res.status(201).json({ transacao, maquinaValor: parseFloat(maquinaValor) });
+    res.status(201).json({ transacao, maquinaValor: parseFloat(maquinaValor), taxa: taxaPerc });
   } catch (error) {
     res.status(500).json({ error: "Erro ao registrar saque", details: error.message });
   }
@@ -5140,7 +5194,7 @@ app.get("/api/pdv-caixa-controle/historico", async (req, res) => {
 // Abrir novo caixa
 app.post("/api/pdv-caixa-controle/abrir", async (req, res) => {
   try {
-    const { saldoInicial, observacao } = req.body;
+    const { saldoInicial, observacao, origemBAG, origemMAQUINA } = req.body;
 
     // Verificar se já existe caixa aberto
     const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
@@ -5181,6 +5235,36 @@ app.post("/api/pdv-caixa-controle/abrir", async (req, res) => {
       },
       include: { transacoes: true },
     });
+
+    // Inicializar saldos de BAG e MÁQUINA se fornecidos
+    const initOrigem = async (nome, valor) => {
+      const reg = await prisma.pdvOrigemSaldo.findUnique({ where: { nome } });
+      if (!reg) return;
+      const saldoAntes = reg.saldo;
+      const saldoDepois = parseFloat(valor);
+      await prisma.$transaction([
+        prisma.pdvOrigemSaldo.update({ where: { nome }, data: { saldo: saldoDepois } }),
+        prisma.pdvOrigemSaldoMovimento.create({
+          data: {
+            origemId: reg.id,
+            tipo: "AJUSTE",
+            valor: Math.abs(saldoDepois - saldoAntes),
+            saldoAntes,
+            saldoDepois,
+            descricao: "Saldo inicial de abertura do caixa",
+            userId,
+            userName,
+          },
+        }),
+      ]);
+    };
+
+    if (origemBAG !== undefined && origemBAG !== null && origemBAG !== "") {
+      await initOrigem("BAG", origemBAG);
+    }
+    if (origemMAQUINA !== undefined && origemMAQUINA !== null && origemMAQUINA !== "") {
+      await initOrigem("MÁQUINA", origemMAQUINA);
+    }
 
     res.status(201).json(novoCaixa);
   } catch (error) {
