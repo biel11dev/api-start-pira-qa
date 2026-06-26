@@ -243,9 +243,17 @@ model Sale {
   change         Float
   date           DateTime
   operator       String?
+  origem         String     @default("PDV")     // "PDV" ou "ONLINE" (pedido do Start-Pira-Net)
+  statusPedido   String?    @default("pending")  // pending, preparing, ready, delivered, cancelled
+  customerPhone  String?    // telefone do cliente (pedido online)
+  customerAddress String?   // endereço do cliente (pedido online / entrega futura)
+  observacoes    String?    // observações do cliente (pedido online)
   items          SaleItem[]
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
+
+  @@index([origem])
+  @@index([statusPedido])
 }
 
 model SaleItem {

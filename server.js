@@ -2549,7 +2549,7 @@ app.delete("/api/categories/:id", async (req, res) => {
 // Rota para criar uma nova venda (PDV) com baixa de estoque
 app.post('/api/sales', async (req, res) => {
   try {
-    const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal } = req.body;
+    const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal, origem, statusPedido, customerPhone, customerAddress, observacoes } = req.body;
 
     // Identificar operador pelo token JWT
     let operatorName = null;
@@ -2658,6 +2658,11 @@ app.post('/api/sales', async (req, res) => {
           change: parseFloat(change) || 0,
           date: parseISO(date),
           operator: operatorName,
+          origem: origem === 'ONLINE' ? 'ONLINE' : 'PDV',
+          statusPedido: origem === 'ONLINE' ? (statusPedido || 'pending') : null,
+          customerPhone: customerPhone || null,
+          customerAddress: customerAddress || null,
+          observacoes: observacoes || null,
           items: {
             create: items.map(item => ({
               estoqueId: item.id,
@@ -2956,6 +2961,98 @@ app.get('/api/sales', async (req, res) => {
     res.json(sales);
   } catch (error) {
     console.error('Erro ao buscar vendas:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+// ===== PEDIDOS ONLINE (origem ONLINE, vindos do Start-Pira-Net) =====
+
+// Status válidos e rótulos do fluxo de pedido online
+const PEDIDO_STATUS_LABELS = {
+  pending: 'Pendente',
+  preparing: 'Em preparo',
+  ready: 'Pronto para retirada',
+  delivered: 'Entregue',
+  cancelled: 'Cancelado'
+};
+
+// Normaliza telefone para o link wa.me (apenas dígitos, DDI 55 para BR)
+const normalizarTelefonePedido = (telefone) => {
+  if (!telefone) return null;
+  let digitos = String(telefone).replace(/\D/g, '');
+  if (!digitos) return null;
+  if (digitos.length <= 11) digitos = `55${digitos}`;
+  return digitos;
+};
+
+// Monta a mensagem de follow-up enviada ao cliente conforme a etapa
+const montarMensagemPedido = (sale, status) => {
+  const nome = sale.customerName || 'cliente';
+  const pedido = `#${sale.id}`;
+  const mensagens = {
+    pending: `Olá, ${nome}! 😊 Recebemos o seu pedido ${pedido} e já estamos cuidando dele. Em breve avisamos as próximas etapas!`,
+    preparing: `${nome}, seu pedido ${pedido} já está *em preparo*! 👩‍🍳 Logo logo fica pronto.`,
+    ready: `Boa notícia, ${nome}! ✅ Seu pedido ${pedido} está *pronto para retirada*!`,
+    delivered: `Pedido ${pedido} *entregue*! 🎉 Obrigado pela preferência, ${nome}. Bom apetite!`,
+    cancelled: `${nome}, infelizmente seu pedido ${pedido} foi *cancelado*. Em caso de dúvidas, fale com a gente.`
+  };
+  return mensagens[status] || `Atualização do seu pedido ${pedido}: ${PEDIDO_STATUS_LABELS[status] || status}.`;
+};
+
+// Gera o link wa.me de follow-up para o cliente (ou null se não houver telefone)
+const gerarLinkPedidoCliente = (sale, status) => {
+  const telefone = normalizarTelefonePedido(sale.customerPhone);
+  const mensagem = montarMensagemPedido(sale, status);
+  if (!telefone) return { link: null, mensagem, hasPhone: false };
+  return { link: `https://wa.me/${telefone}?text=${encodeURIComponent(mensagem)}`, mensagem, hasPhone: true };
+};
+
+// GET - Listar pedidos online (com filtro opcional por status)
+app.get('/api/sales/online', async (req, res) => {
+  try {
+    const { status } = req.query;
+    const where = { origem: 'ONLINE' };
+    if (status && PEDIDO_STATUS_LABELS[status]) where.statusPedido = status;
+
+    const pedidos = await prisma.sale.findMany({
+      where,
+      include: { items: true },
+      orderBy: { date: 'desc' },
+    });
+    res.json(pedidos);
+  } catch (error) {
+    console.error('Erro ao buscar pedidos online:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+// PUT - Atualizar status de um pedido online (retorna link wa.me para o cliente)
+app.put('/api/sales/:id/status', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: 'ID inválido' });
+
+    const { status } = req.body;
+    if (!status || !PEDIDO_STATUS_LABELS[status]) {
+      return res.status(400).json({ error: 'Status inválido', validStatuses: Object.keys(PEDIDO_STATUS_LABELS) });
+    }
+
+    const existente = await prisma.sale.findUnique({ where: { id } });
+    if (!existente) return res.status(404).json({ error: 'Pedido não encontrado' });
+    if (existente.origem !== 'ONLINE') {
+      return res.status(400).json({ error: 'Apenas pedidos online possuem status gerenciável' });
+    }
+
+    const pedido = await prisma.sale.update({
+      where: { id },
+      data: { statusPedido: status },
+      include: { items: true },
+    });
+
+    const whatsapp = gerarLinkPedidoCliente(pedido, status);
+    res.json({ ...pedido, whatsapp });
+  } catch (error) {
+    console.error('Erro ao atualizar status do pedido:', error);
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
 });
