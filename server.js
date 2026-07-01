@@ -2552,7 +2552,21 @@ app.delete("/api/categories/:id", async (req, res) => {
 // Rota para criar uma nova venda (PDV) com baixa de estoque
 app.post('/api/sales', async (req, res) => {
   try {
-    const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal, origem, statusPedido, customerPhone, customerAddress, observacoes } = req.body;
+    const { items, total, paymentMethod, customerName, amountReceived, change, date, discount, splitPayments: splitPay, pendente, vale, subtotal, finalTotal, origem, statusPedido, customerPhone, customerAddress, observacoes, saque } = req.body;
+
+    // Saque junto da venda (dinheiro entregue ao cliente + taxa sobre o saque)
+    const saqueValorNum = saque && parseFloat(saque.valor) > 0 ? parseFloat(saque.valor) : 0;
+    const saqueTaxaNum = saqueValorNum > 0 ? (parseFloat(saque.taxa) || 0) : 0;
+    const saqueFee = saqueValorNum > 0 ? saqueValorNum * (saqueTaxaNum / 100) : 0;
+
+    // Se há saque, exige caixa aberto para registrar a saída do dinheiro
+    if (saqueValorNum > 0) {
+      const caixaSaque = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
+      if (!caixaSaque) {
+        return res.status(400).json({ error: "Nenhum caixa aberto. Abra o caixa antes de realizar um saque na venda." });
+      }
+    }
+
 
     // Identificar operador pelo token JWT
     let operatorName = null;
@@ -2647,7 +2661,7 @@ app.post('/api/sales', async (req, res) => {
       if (!isValid) return res.status(401).json({ error: "Senha do Vale incorreta." });
     }
 
-    const saleTotal = parseFloat(finalTotal || total);
+    const saleTotal = parseFloat(finalTotal || total) + saqueFee;
 
     // Usar transação para garantir consistência entre venda, estoque e movimentação
     const result = await prisma.$transaction(async (tx) => {
@@ -2666,6 +2680,8 @@ app.post('/api/sales', async (req, res) => {
           customerPhone: customerPhone || null,
           customerAddress: customerAddress || null,
           observacoes: observacoes || null,
+          saqueValor: saqueValorNum,
+          saqueTaxa: saqueTaxaNum,
           items: {
             create: items.map(item => ({
               estoqueId: item.id,
@@ -2886,15 +2902,22 @@ app.post('/api/sales', async (req, res) => {
       if (caixaAberto) {
         // Não registrar vendas 100% pendentes (fiado) como entrada imediata no caixa
         const isPendenteTotal = !splitPay && paymentMethod?.toLowerCase().includes("pendente");
-        const valorEntrada = splitPay
+        let valorEntrada = splitPay
           ? splitPay
               .filter(s => s.forma !== "pendente")
               .reduce((acc, s) => acc + (parseFloat(s.valor) || 0), 0)
           : isPendenteTotal ? 0 : saleTotal;
 
+        // Com saque: o cliente também paga o valor sacado na máquina, então a entrada
+        // reflete o total cobrado (produtos + taxa + saque). A saída do dinheiro é lançada abaixo.
+        if (saqueValorNum > 0 && !splitPay && !isPendenteTotal) {
+          valorEntrada += saqueValorNum;
+        }
+
         if (valorEntrada > 0) {
           const descricaoEntrada = `Venda #${result.id} — ${customerName || "Cliente não identificado"}` +
-            (splitPay ? ` (${splitPay.map(s => `${s.forma}: R$${parseFloat(s.valor).toFixed(2)}`).join(", ")})` : ` — ${paymentMethod}`);
+            (splitPay ? ` (${splitPay.map(s => `${s.forma}: R$${parseFloat(s.valor).toFixed(2)}`).join(", ")})` : ` — ${paymentMethod}`) +
+            (saqueValorNum > 0 ? ` (inclui saque R$${saqueValorNum.toFixed(2)})` : "");
 
           await prisma.pdvCaixaTransacao.create({
             data: {
@@ -2903,6 +2926,21 @@ app.post('/api/sales', async (req, res) => {
               categoria: "VENDA",
               valor: valorEntrada,
               descricao: descricaoEntrada,
+              userId: null,
+              userName: operatorName || null,
+            },
+          });
+        }
+
+        // Saída do dinheiro entregue ao cliente (saque junto da venda)
+        if (saqueValorNum > 0) {
+          await prisma.pdvCaixaTransacao.create({
+            data: {
+              caixaId: caixaAberto.id,
+              tipo: "SAIDA",
+              categoria: "SAQUE",
+              valor: saqueValorNum,
+              descricao: `Saque na Venda #${result.id} — R$${saqueValorNum.toFixed(2)} (taxa ${saqueTaxaNum}%, cobrado R$${(saqueValorNum + saqueFee).toFixed(2)})`,
               userId: null,
               userName: operatorName || null,
             },

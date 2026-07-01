@@ -248,6 +248,8 @@ model Sale {
   customerPhone  String?    // telefone do cliente (pedido online)
   customerAddress String?   // endereço do cliente (pedido online / entrega futura)
   observacoes    String?    // observações do cliente (pedido online)
+  saqueValor     Float      @default(0)  // valor sacado em dinheiro entregue ao cliente (saque junto da venda)
+  saqueTaxa      Float      @default(0)  // percentual de taxa aplicado sobre o saque
   items          SaleItem[]
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
