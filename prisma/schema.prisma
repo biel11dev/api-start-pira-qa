@@ -441,12 +441,14 @@ model PdvConfigVenda {
 }
 
 model PdvFormaPagamento {
-  id        Int      @id @default(autoincrement())
-  nome      String   @unique  // Ex: "Dinheiro", "Cartão", "PIX", "Fiado"
-  valor     String   // valor interno usado no sistema (ex: "dinheiro", "cartao", "pix", "fiado")
-  ativo     Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           Int      @id @default(autoincrement())
+  nome         String   @unique  // Ex: "Dinheiro", "Cartão", "PIX", "Fiado"
+  valor        String   // valor interno usado no sistema (ex: "dinheiro", "cartao", "pix", "fiado")
+  ativo        Boolean  @default(true)
+  pointEnabled Boolean  @default(false) // se true, o pagamento é processado na maquininha Mercado Pago Point
+  pointType    String?  // tipo de meio enviado à Point: "credit_card" | "debit_card" | null (o comprador escolhe no terminal)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 model PdvComanda {
@@ -648,5 +650,31 @@ model PdvOrigemSaldoMovimento {
   createdAt   DateTime @default(now())
 
   @@index([origemId])
+  @@index([createdAt])
+}
+
+// Ordem de pagamento presencial criada na maquininha Mercado Pago Point.
+// Persiste o vínculo entre a order do Mercado Pago e a venda gerada no PDV,
+// permitindo conciliação via polling de status e via webhook.
+model PointOrder {
+  id                Int       @id @default(autoincrement())
+  mpOrderId         String?   @unique  // ID da order no Mercado Pago (ORD...)
+  externalReference String    @unique  // referência externa gerada pelo PDV
+  terminalId        String    // terminal Point utilizado
+  amount            Float     // valor da transação
+  paymentType       String?   // "credit_card" | "debit_card" | null
+  installments      Int       @default(1)
+  description       String?
+  status            String    @default("created") // created, at_terminal, processed, canceled, failed, expired, refunded, action_required
+  statusDetail      String?
+  mpPaymentId       String?   // ID do pagamento aprovado (PAY...)
+  saleId            Int?      // venda gerada no PDV após aprovação
+  operator          String?
+  rawPayload        String?   // último payload/resposta relevante (JSON) para auditoria
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([status])
+  @@index([mpOrderId])
   @@index([createdAt])
 }

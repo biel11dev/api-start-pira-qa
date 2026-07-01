@@ -13,13 +13,15 @@ const app = express();
 const port = 3000;
 const SECRET_KEY = process.env.SECRET_KEY || "2a51f0c6b96167b01f59b41aa2407066735cc39ee71ebd041d8ff59b75c60c15";
 const path = require("path");
+const axios = require("axios");
+const crypto = require("crypto");
 
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        connectSrc: ["'self'", "https://api-start-pira.vercel.app"],
+        connectSrc: ["'self'", "https://api-start-pira.vercel.app", "https://api-start-pira-qa.vercel.app"],
         scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", "data:"],
@@ -51,6 +53,7 @@ const rotaParaModulo = (rota) => {
   if (rota.includes("/api/sales")) return "pdv";
   if (rota.includes("/api/estoque")) return "pdv";
   if (rota.includes("/api/pdv-caixa") || rota.includes("/api/pdv-origens") || rota.includes("/api/pdv-origem-saldo")) return "pdv";
+  if (rota.includes("/api/point")) return "pdv";
   if (rota.includes("/api/products")) return "produtos";
   if (rota.includes("/api/categories")) return "estoque";
   if (rota.includes("/api/unit-equivalences")) return "estoque";
@@ -4956,10 +4959,14 @@ app.post("/api/pdv-formas-pagamento", async (req, res) => {
 
 app.put("/api/pdv-formas-pagamento/:id", async (req, res) => {
   try {
-    const { ativo } = req.body;
+    const { ativo, pointEnabled, pointType } = req.body;
+    const data = {};
+    if (ativo !== undefined) data.ativo = ativo;
+    if (pointEnabled !== undefined) data.pointEnabled = !!pointEnabled;
+    if (pointType !== undefined) data.pointType = pointType || null; // "credit_card" | "debit_card" | null
     const forma = await prisma.pdvFormaPagamento.update({
       where: { id: parseInt(req.params.id) },
-      data: { ativo },
+      data,
     });
     res.json(forma);
   } catch (error) {
@@ -5903,6 +5910,408 @@ app.post("/api/auditoria-config/init", async (req, res) => {
     res.json(results);
   } catch (error) {
     res.status(500).json({ error: "Erro ao inicializar configurações", details: error.message });
+  }
+});
+
+/* =========================================================================
+ * MERCADO PAGO POINT (pagamento presencial na maquininha)
+ * Integração via API de Orders unificada.
+ * Docs: https://www.mercadopago.com.br/developers/pt/docs/mp-point/overview
+ * ========================================================================= */
+
+const MP_BASE = "https://api.mercadopago.com";
+const POINT_CONFIG_KEYS = ["point_terminal_id", "point_print_on_terminal", "point_default_installments"];
+
+// Cria um cliente axios autenticado para o Mercado Pago.
+function mpClient() {
+  const token = process.env.MP_ACCESS_TOKEN;
+  if (!token) {
+    const err = new Error("MP_ACCESS_TOKEN não configurado no servidor. Defina a variável de ambiente com o Access Token da sua aplicação Mercado Pago.");
+    err.statusCode = 503;
+    throw err;
+  }
+  return axios.create({
+    baseURL: MP_BASE,
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    timeout: 20000,
+  });
+}
+
+// Normaliza mensagens de erro vindas do Mercado Pago.
+function mpErrorPayload(error) {
+  const status = error.response?.status || error.statusCode || 500;
+  const data = error.response?.data;
+  const message = data?.message || data?.error || error.message || "Erro ao comunicar com o Mercado Pago.";
+  return { status, message, details: data || null };
+}
+
+// Lê a configuração da Point a partir de PdvConfigVenda (com fallback para env).
+async function getPointConfig() {
+  const rows = await prisma.pdvConfigVenda.findMany({ where: { chave: { in: POINT_CONFIG_KEYS } } });
+  const map = {};
+  rows.forEach((r) => { map[r.chave] = r.valor; });
+  return {
+    terminalId: map.point_terminal_id || process.env.MP_TERMINAL_ID || "",
+    printOnTerminal: map.point_print_on_terminal || "no_ticket",
+    defaultInstallments: parseInt(map.point_default_installments || "1", 10) || 1,
+  };
+}
+
+// Converte o status do Mercado Pago em um status normalizado para o PDV.
+function normalizePointStatus(mpStatus, action) {
+  const s = (action || mpStatus || "").toString().toLowerCase().replace("order.", "");
+  if (["processed", "accredited", "approved"].includes(s)) return "processed";
+  if (["canceled", "cancelled"].includes(s)) return "canceled";
+  if (s === "refunded") return "refunded";
+  if (s === "failed" || s === "rejected") return "failed";
+  if (s === "expired") return "expired";
+  if (s === "action_required") return "action_required";
+  return "pending"; // created, at_terminal, opened, etc.
+}
+
+// Gera uma referência externa válida (letras, números, - e _; máx. 64 chars).
+function buildExternalReference() {
+  const raw = `PDV-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+}
+
+// GET config atual da Point + estado das credenciais.
+app.get("/api/point/config", async (req, res) => {
+  try {
+    const config = await getPointConfig();
+    res.json({
+      configured: !!process.env.MP_ACCESS_TOKEN && !!config.terminalId,
+      tokenConfigured: !!process.env.MP_ACCESS_TOKEN,
+      webhookConfigured: !!process.env.MP_WEBHOOK_SECRET,
+      terminal_id: config.terminalId,
+      print_on_terminal: config.printOnTerminal,
+      default_installments: config.defaultInstallments,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao carregar configuração da Point", details: error.message });
+  }
+});
+
+// PUT atualiza config da Point.
+app.put("/api/point/config", async (req, res) => {
+  try {
+    const terminalId = req.body.terminalId ?? req.body.terminal_id;
+    const printOnTerminal = req.body.printOnTerminal ?? req.body.print_on_terminal;
+    const defaultInstallments = req.body.defaultInstallments ?? req.body.default_installments;
+    const updates = [];
+    if (terminalId !== undefined) updates.push(["point_terminal_id", String(terminalId)]);
+    if (printOnTerminal !== undefined) updates.push(["point_print_on_terminal", String(printOnTerminal)]);
+    if (defaultInstallments !== undefined) updates.push(["point_default_installments", String(defaultInstallments)]);
+    for (const [chave, valor] of updates) {
+      await prisma.pdvConfigVenda.upsert({
+        where: { chave },
+        update: { valor },
+        create: { chave, valor, descricao: "Configuração Mercado Pago Point" },
+      });
+    }
+    const config = await getPointConfig();
+    res.json({
+      configured: !!process.env.MP_ACCESS_TOKEN && !!config.terminalId,
+      tokenConfigured: !!process.env.MP_ACCESS_TOKEN,
+      webhookConfigured: !!process.env.MP_WEBHOOK_SECRET,
+      terminal_id: config.terminalId,
+      print_on_terminal: config.printOnTerminal,
+      default_installments: config.defaultInstallments,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao salvar configuração da Point", details: error.message });
+  }
+});
+
+// GET lista de terminals Point vinculados à conta.
+app.get("/api/point/terminals", async (req, res) => {
+  try {
+    const { data } = await mpClient().get("/terminals/v1/list", { params: { limit: 50 } });
+    res.json({ terminals: data?.data?.terminals || [] });
+  } catch (error) {
+    const { status, message, details } = mpErrorPayload(error);
+    res.status(status).json({ error: message, details });
+  }
+});
+
+// POST ativa/desativa o modo de operação (PDV) de um terminal.
+app.post("/api/point/terminals/mode", async (req, res) => {
+  try {
+    const { terminalId, mode } = req.body;
+    if (!terminalId) return res.status(400).json({ error: "terminalId é obrigatório." });
+    const operating_mode = (mode || "PDV").toUpperCase() === "STANDALONE" ? "STANDALONE" : "PDV";
+    const { data } = await mpClient().patch("/terminals/v1/setup", {
+      terminals: [{ id: terminalId, operating_mode }],
+    });
+    res.json(data);
+  } catch (error) {
+    const { status, message, details } = mpErrorPayload(error);
+    res.status(status).json({ error: message, details });
+  }
+});
+
+// POST cria uma order de pagamento na maquininha.
+app.post("/api/point/orders", async (req, res) => {
+  const config = await getPointConfig();
+  const { amount, paymentType, installments, description } = req.body;
+  const terminalId = req.body.terminalId || config.terminalId;
+  const printOnTerminal = req.body.printOnTerminal || config.printOnTerminal;
+  const parsedAmount = Number(amount);
+
+  if (!terminalId) return res.status(400).json({ error: "Nenhum terminal Point configurado. Selecione um terminal nas configurações do PDV." });
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: "Valor inválido para o pagamento." });
+
+  // Identifica o operador pelo token JWT (quando presente).
+  let operatorName = req.body.operator || null;
+  try {
+    const authHeader = req.headers.authorization;
+    if (!operatorName && authHeader?.startsWith("Bearer ")) {
+      const decoded = jwt.verify(authHeader.split(" ")[1], SECRET_KEY);
+      const user = await prisma.user.findUnique({ where: { id: decoded.userId }, select: { name: true, username: true } });
+      if (user) operatorName = user.name || user.username;
+    }
+  } catch { /* token opcional */ }
+
+  const externalReference = buildExternalReference();
+  const parcelas = parseInt(installments, 10) > 0 ? parseInt(installments, 10) : config.defaultInstallments;
+
+  // Registra a intenção localmente antes de enviar ao Mercado Pago.
+  const pointOrder = await prisma.pointOrder.create({
+    data: {
+      externalReference,
+      terminalId,
+      amount: parsedAmount,
+      paymentType: paymentType || null,
+      installments: parcelas,
+      description: description || "Venda PDV",
+      status: "created",
+      operator: operatorName,
+    },
+  });
+
+  const mpBody = {
+    type: "point",
+    external_reference: externalReference,
+    expiration_time: "PT16M",
+    transactions: { payments: [{ amount: parsedAmount.toFixed(2) }] },
+    config: {
+      point: {
+        terminal_id: terminalId,
+        print_on_terminal: printOnTerminal,
+      },
+      ...(paymentType
+        ? {
+            payment_method: {
+              default_type: paymentType,
+              default_installments: parcelas,
+              installments_cost: "seller",
+            },
+          }
+        : {}),
+    },
+    description: description || "Venda PDV",
+  };
+
+  // Dados de integração opcionais (parceiro/integrador).
+  if (process.env.MP_INTEGRATOR_ID || process.env.MP_PLATFORM_ID) {
+    mpBody.integration_data = {
+      ...(process.env.MP_PLATFORM_ID ? { platform_id: process.env.MP_PLATFORM_ID } : {}),
+      ...(process.env.MP_INTEGRATOR_ID ? { integrator_id: process.env.MP_INTEGRATOR_ID } : {}),
+    };
+  }
+
+  try {
+    const { data } = await mpClient().post("/v1/orders", mpBody, {
+      headers: { "X-Idempotency-Key": crypto.randomUUID() },
+    });
+    const updated = await prisma.pointOrder.update({
+      where: { id: pointOrder.id },
+      data: {
+        mpOrderId: data.id,
+        status: normalizePointStatus(data.status),
+        statusDetail: data.status_detail || null,
+        rawPayload: JSON.stringify(data).slice(0, 4000),
+      },
+    });
+    res.status(201).json({
+      id: updated.id,
+      mpOrderId: updated.mpOrderId,
+      externalReference: updated.externalReference,
+      terminalId: updated.terminalId,
+      amount: updated.amount,
+      status: updated.status,
+    });
+  } catch (error) {
+    const { status, message, details } = mpErrorPayload(error);
+    await prisma.pointOrder.update({
+      where: { id: pointOrder.id },
+      data: { status: "failed", statusDetail: message, rawPayload: JSON.stringify(details || {}).slice(0, 4000) },
+    });
+    res.status(status).json({ error: message, details });
+  }
+});
+
+// GET consulta o status de uma order (busca no Mercado Pago e atualiza o registro local).
+app.get("/api/point/orders/:id", async (req, res) => {
+  try {
+    const pointOrder = await prisma.pointOrder.findUnique({ where: { id: parseInt(req.params.id, 10) } });
+    if (!pointOrder) return res.status(404).json({ error: "Order não encontrada." });
+
+    // Sem mpOrderId (falha na criação) ou em estado final: devolve o que temos.
+    if (!pointOrder.mpOrderId) {
+      return res.json(serializePointOrder(pointOrder));
+    }
+
+    try {
+      const { data } = await mpClient().get(`/v1/orders/${pointOrder.mpOrderId}`);
+      const payment = data.transactions?.payments?.[0] || null;
+      const updated = await prisma.pointOrder.update({
+        where: { id: pointOrder.id },
+        data: {
+          status: normalizePointStatus(data.status),
+          statusDetail: data.status_detail || payment?.status_detail || null,
+          mpPaymentId: payment?.id || pointOrder.mpPaymentId,
+          rawPayload: JSON.stringify(data).slice(0, 4000),
+        },
+      });
+      return res.json(serializePointOrder(updated, data));
+    } catch (mpError) {
+      // Falha ao consultar o MP: retorna o status local conhecido.
+      return res.json(serializePointOrder(pointOrder));
+    }
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao consultar order", details: error.message });
+  }
+});
+
+function serializePointOrder(order, mpData) {
+  return {
+    id: order.id,
+    mpOrderId: order.mpOrderId,
+    externalReference: order.externalReference,
+    terminalId: order.terminalId,
+    amount: order.amount,
+    status: order.status,
+    statusDetail: order.statusDetail,
+    mpPaymentId: order.mpPaymentId,
+    saleId: order.saleId,
+    payment: mpData?.transactions?.payments?.[0] || null,
+  };
+}
+
+// POST cancela uma order em andamento.
+app.post("/api/point/orders/:id/cancel", async (req, res) => {
+  try {
+    const pointOrder = await prisma.pointOrder.findUnique({ where: { id: parseInt(req.params.id, 10) } });
+    if (!pointOrder) return res.status(404).json({ error: "Order não encontrada." });
+    if (pointOrder.mpOrderId) {
+      try {
+        await mpClient().post(`/v1/orders/${pointOrder.mpOrderId}/cancel`);
+      } catch (mpError) {
+        const { status, message, details } = mpErrorPayload(mpError);
+        // Se já estiver processada/cancelada, o MP retorna erro; propaga informação.
+        return res.status(status).json({ error: message, details });
+      }
+    }
+    const updated = await prisma.pointOrder.update({
+      where: { id: pointOrder.id },
+      data: { status: "canceled", statusDetail: "canceled_by_operator" },
+    });
+    res.json(serializePointOrder(updated));
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao cancelar order", details: error.message });
+  }
+});
+
+// PATCH vincula a venda gerada no PDV à order da Point (conciliação).
+app.patch("/api/point/orders/:id", async (req, res) => {
+  try {
+    const { saleId } = req.body;
+    const updated = await prisma.pointOrder.update({
+      where: { id: parseInt(req.params.id, 10) },
+      data: { ...(saleId !== undefined ? { saleId: parseInt(saleId, 10) } : {}) },
+    });
+    res.json(serializePointOrder(updated));
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao vincular venda à order", details: error.message });
+  }
+});
+
+// Valida a assinatura (x-signature) das notificações webhook do Mercado Pago.
+function validatePointWebhookSignature(req) {
+  const secret = process.env.MP_WEBHOOK_SECRET;
+  if (!secret) return true; // sem secret configurado (ambiente de desenvolvimento) -> não bloqueia
+  const xSignature = req.headers["x-signature"];
+  const xRequestId = req.headers["x-request-id"];
+  if (!xSignature) return false;
+
+  const parts = {};
+  xSignature.split(",").forEach((p) => {
+    const [k, v] = p.split("=");
+    if (k && v) parts[k.trim()] = v.trim();
+  });
+  const ts = parts.ts;
+  const receivedHash = parts.v1;
+  if (!ts || !receivedHash) return false;
+
+  const dataId = (req.query["data.id"] || req.query.id || req.body?.data?.id || "").toString();
+  let manifest = "";
+  if (dataId) manifest += `id:${dataId};`;
+  if (xRequestId) manifest += `request-id:${xRequestId};`;
+  manifest += `ts:${ts};`;
+
+  const expected = crypto.createHmac("sha256", secret).update(manifest).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(receivedHash));
+  } catch {
+    return false;
+  }
+}
+
+// POST recebe as notificações de order do Mercado Pago Point.
+app.post("/api/point/webhook", async (req, res) => {
+  // Responde rápido; sempre 200 para evitar reenvios, mesmo em casos não tratados.
+  try {
+    if (!validatePointWebhookSignature(req)) {
+      return res.status(401).json({ error: "Assinatura inválida." });
+    }
+
+    const action = req.body?.action || null;
+    const mpOrderId = req.body?.data?.id || req.query["data.id"] || null;
+    if (mpOrderId) {
+      const existing = await prisma.pointOrder.findUnique({ where: { mpOrderId: String(mpOrderId) } });
+      if (existing) {
+        let status = normalizePointStatus(req.body?.data?.status, action);
+        let statusDetail = req.body?.data?.status_detail || action || null;
+        let mpPaymentId = req.body?.data?.transactions?.payments?.[0]?.id || existing.mpPaymentId;
+
+        // Em caso de aprovação, busca a order completa para registrar o pagamento.
+        if (status === "processed" && process.env.MP_ACCESS_TOKEN) {
+          try {
+            const { data } = await mpClient().get(`/v1/orders/${mpOrderId}`);
+            const payment = data.transactions?.payments?.[0];
+            status = normalizePointStatus(data.status, action);
+            statusDetail = data.status_detail || statusDetail;
+            mpPaymentId = payment?.id || mpPaymentId;
+          } catch { /* mantém dados do webhook */ }
+        }
+
+        await prisma.pointOrder.update({
+          where: { id: existing.id },
+          data: {
+            status,
+            statusDetail,
+            mpPaymentId,
+            rawPayload: JSON.stringify(req.body).slice(0, 4000),
+          },
+        });
+      }
+    }
+    return res.status(200).json({ received: true });
+  } catch (error) {
+    console.error("[Point webhook] erro:", error.message);
+    // Responde 200 para não gerar reenvios em loop; erro já foi logado.
+    return res.status(200).json({ received: true });
   }
 });
 
