@@ -4667,6 +4667,33 @@ app.get("/api/pdv-origem-saldo/:nome/historico", async (req, res) => {
   try {
     const { nome } = req.params;
     const { limit = 50 } = req.query;
+
+    // Origem CAIXA: o histórico vem das transações do caixa aberto (mesma fonte do saldo),
+    // pois vendas/saque/abertura são registradas em pdvCaixaTransacao (e não em pdvOrigemSaldoMovimento).
+    if (nome === "CAIXA") {
+      const caixaAberto = await prisma.pdvCaixaControle.findFirst({
+        where: { status: "ABERTO" },
+        include: { transacoes: { orderBy: { createdAt: "asc" } } },
+      });
+      if (!caixaAberto) {
+        return res.json({ origem: { nome: "CAIXA", saldo: 0 }, movimentos: [] });
+      }
+      let saldo = 0;
+      const movsAsc = caixaAberto.transacoes.map((t) => {
+        saldo += t.tipo === "ENTRADA" ? t.valor : -t.valor;
+        return {
+          id: t.id,
+          tipo: t.tipo,
+          valor: t.valor,
+          saldoDepois: parseFloat(saldo.toFixed(2)),
+          descricao: t.descricao,
+          createdAt: t.createdAt,
+        };
+      });
+      const movimentos = movsAsc.reverse().slice(0, parseInt(limit));
+      return res.json({ origem: { nome: "CAIXA", saldo: parseFloat(saldo.toFixed(2)) }, movimentos });
+    }
+
     const origem = await prisma.pdvOrigemSaldo.findUnique({ where: { nome } });
     if (!origem) return res.status(404).json({ error: `Origem "${nome}" não encontrada.` });
 
