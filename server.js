@@ -5964,7 +5964,7 @@ async function getPointConfig() {
   rows.forEach((r) => { map[r.chave] = r.valor; });
   return {
     terminalId: map.point_terminal_id || process.env.MP_TERMINAL_ID || "",
-    printOnTerminal: map.point_print_on_terminal || "no_ticket",
+    printOnTerminal: ["seller_ticket", "no_ticket"].includes(map.point_print_on_terminal) ? map.point_print_on_terminal : "no_ticket",
     defaultInstallments: parseInt(map.point_default_installments || "1", 10) || 1,
   };
 }
