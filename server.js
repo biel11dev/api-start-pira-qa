@@ -3026,6 +3026,30 @@ app.get('/api/sales/online', async (req, res) => {
   }
 });
 
+// GET - Status (leve) de pedidos online por ids (ex: /api/sales/status?ids=1,2,3)
+// Usado pela API pública (net) para sincronizar o andamento no histórico do cliente.
+app.get('/api/sales/status', async (req, res) => {
+  try {
+    const idsParam = String(req.query.ids || '').trim();
+    if (!idsParam) return res.json([]);
+
+    const ids = idsParam
+      .split(',')
+      .map((v) => parseInt(v.trim(), 10))
+      .filter((n) => Number.isInteger(n));
+    if (ids.length === 0) return res.json([]);
+
+    const pedidos = await prisma.sale.findMany({
+      where: { id: { in: ids }, origem: 'ONLINE' },
+      select: { id: true, statusPedido: true },
+    });
+    res.json(pedidos);
+  } catch (error) {
+    console.error('Erro ao buscar status de pedidos:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
 // PUT - Atualizar status de um pedido online (retorna link wa.me para o cliente)
 app.put('/api/sales/:id/status', async (req, res) => {
   try {
