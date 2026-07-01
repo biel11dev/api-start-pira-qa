@@ -5941,7 +5941,19 @@ function mpClient() {
 function mpErrorPayload(error) {
   const status = error.response?.status || error.statusCode || 500;
   const data = error.response?.data;
-  const message = data?.message || data?.error || error.message || "Erro ao comunicar com o Mercado Pago.";
+  let message = data?.message || data?.error || error.message || "Erro ao comunicar com o Mercado Pago.";
+  // A Orders API detalha os erros em arrays (errors[] ou cause[]). Extrai algo legível.
+  const parts = [];
+  if (Array.isArray(data?.errors)) {
+    data.errors.forEach((e) => {
+      const det = Array.isArray(e.details) ? e.details.join(", ") : (e.details || "");
+      parts.push([e.code, e.message, det].filter(Boolean).join(": "));
+    });
+  }
+  if (Array.isArray(data?.cause)) {
+    data.cause.forEach((c) => parts.push([c.code, c.description].filter(Boolean).join(": ")));
+  }
+  if (parts.length) message = `${message} — ${parts.join(" | ")}`;
   return { status, message, details: data || null };
 }
 
@@ -5952,7 +5964,7 @@ async function getPointConfig() {
   rows.forEach((r) => { map[r.chave] = r.valor; });
   return {
     terminalId: map.point_terminal_id || process.env.MP_TERMINAL_ID || "",
-    printOnTerminal: map.point_print_on_terminal || "no_ticket",
+    printOnTerminal: ["true", "buyer_ticket", "seller_ticket", "1"].includes(map.point_print_on_terminal),
     defaultInstallments: parseInt(map.point_default_installments || "1", 10) || 1,
   };
 }
@@ -6089,25 +6101,21 @@ app.post("/api/point/orders", async (req, res) => {
     },
   });
 
+  // Corpo conforme a Orders API atual para Point (type: "point").
+  // O tipo (crédito/débito) vai em transactions.payments[].payment_method; sem esse campo, o terminal decide.
+  const payment = { amount: parsedAmount.toFixed(2) };
+  if (paymentType) {
+    payment.payment_method = { type: paymentType, installments: parcelas };
+  }
   const mpBody = {
     type: "point",
     external_reference: externalReference,
-    expiration_time: "PT16M",
-    transactions: { payments: [{ amount: parsedAmount.toFixed(2) }] },
+    transactions: { payments: [payment] },
     config: {
       point: {
         terminal_id: terminalId,
-        print_on_terminal: printOnTerminal,
+        print_on_terminal: !!printOnTerminal,
       },
-      ...(paymentType
-        ? {
-            payment_method: {
-              default_type: paymentType,
-              default_installments: parcelas,
-              installments_cost: "seller",
-            },
-          }
-        : {}),
     },
     description: description || "Venda PDV",
   };
@@ -6143,6 +6151,7 @@ app.post("/api/point/orders", async (req, res) => {
     });
   } catch (error) {
     const { status, message, details } = mpErrorPayload(error);
+    console.error("Erro ao criar order Point no Mercado Pago:", status, JSON.stringify(details || message));
     await prisma.pointOrder.update({
       where: { id: pointOrder.id },
       data: { status: "failed", statusDetail: message, rawPayload: JSON.stringify(details || {}).slice(0, 4000) },
