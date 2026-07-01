@@ -5964,7 +5964,7 @@ async function getPointConfig() {
   rows.forEach((r) => { map[r.chave] = r.valor; });
   return {
     terminalId: map.point_terminal_id || process.env.MP_TERMINAL_ID || "",
-    printOnTerminal: ["true", "buyer_ticket", "seller_ticket", "1"].includes(map.point_print_on_terminal),
+    printOnTerminal: map.point_print_on_terminal || "no_ticket",
     defaultInstallments: parseInt(map.point_default_installments || "1", 10) || 1,
   };
 }
@@ -6102,19 +6102,17 @@ app.post("/api/point/orders", async (req, res) => {
   });
 
   // Corpo conforme a Orders API atual para Point (type: "point").
-  // O tipo (crédito/débito) vai em transactions.payments[].payment_method; sem esse campo, o terminal decide.
-  const payment = { amount: parsedAmount.toFixed(2) };
-  if (paymentType) {
-    payment.payment_method = { type: paymentType, installments: parcelas };
-  }
+  // Regras validadas pela API: print_on_terminal DEVE ser string ("no_ticket" | "seller_ticket" | "buyer_ticket")
+  // e NÃO é permitido enviar payment_method dentro de transactions.payments[]. O tipo (crédito/débito)
+  // é escolhido pelo cliente no próprio terminal.
   const mpBody = {
     type: "point",
     external_reference: externalReference,
-    transactions: { payments: [payment] },
+    transactions: { payments: [{ amount: parsedAmount.toFixed(2) }] },
     config: {
       point: {
         terminal_id: terminalId,
-        print_on_terminal: !!printOnTerminal,
+        print_on_terminal: printOnTerminal || "no_ticket",
       },
     },
     description: description || "Venda PDV",
