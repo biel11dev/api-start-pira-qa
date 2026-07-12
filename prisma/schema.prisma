@@ -111,6 +111,7 @@ model Estoque {
   value      Float
   valuecusto Float
   contabiliza Boolean  @default(true) // false = descartável (não baixa estoque; usa FollowUp)
+  mostrarPdv Boolean  @default(true) // false = não aparece na tela de venda do PDV
   stockMovements StockMovement[]
   saleItems      SaleItem[]
   composicoes    ComposicaoProduto[]

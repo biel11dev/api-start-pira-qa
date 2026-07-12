@@ -1388,7 +1388,7 @@ app.post("/api/estoque_prod", async (req, res) => {
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId, contabiliza } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, contabiliza, mostrarPdv } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1418,7 +1418,8 @@ app.put("/api/estoque_prod/:id", async (req, res) => {
         value: parsedValue, 
         valuecusto: parsedValueCusto,
         categoria_Id: categoryId ? parseInt(categoryId) : null,
-        ...(contabiliza !== undefined ? { contabiliza: Boolean(contabiliza) } : {})
+        ...(contabiliza !== undefined ? { contabiliza: Boolean(contabiliza) } : {}),
+        ...(mostrarPdv !== undefined ? { mostrarPdv: Boolean(mostrarPdv) } : {})
       },
       include: {
         product: true,
@@ -5360,7 +5361,7 @@ app.put("/api/pdv-saque/config", async (req, res) => {
 
 app.post("/api/pdv-saque", async (req, res) => {
   try {
-    const { valor, observacao } = req.body;
+    const { valor, observacao, formaPagamento, formaPagamentoNome } = req.body;
     if (!valor || parseFloat(valor) <= 0) {
       return res.status(400).json({ error: "Valor inválido para saque." });
     }
@@ -5390,9 +5391,11 @@ app.post("/api/pdv-saque", async (req, res) => {
     const taxaPerc = taxaConfig ? parseFloat(taxaConfig.valor) : 30;
     const multiplicador = 1 + taxaPerc / 100;
     const maquinaValor = (valorNum * multiplicador).toFixed(2);
-    const descricao = observacao
-      ? `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor}, taxa ${taxaPerc}%) — ${observacao}`
-      : `Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor}, taxa ${taxaPerc}%)`;
+    const formaLabel = (formaPagamentoNome || formaPagamento || "").toString().trim();
+    const partes = [`Saque R$${valorNum.toFixed(2)} (máquina: R$${maquinaValor}, taxa ${taxaPerc}%)`];
+    if (formaLabel) partes.push(`Pagamento: ${formaLabel}`);
+    if (observacao) partes.push(observacao);
+    const descricao = partes.join(" — ");
 
     const transacao = await prisma.pdvCaixaTransacao.create({
       data: {
