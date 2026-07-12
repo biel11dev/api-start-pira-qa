@@ -6075,6 +6075,26 @@ function buildExternalReference() {
   return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
 }
 
+// Define quando a pré-seleção da modalidade deve usar a Payment Intents API.
+// A Orders API (type "point") NÃO permite pré-selecionar a modalidade; apenas a
+// Payment Intents API (legada) aceita payment.type = credit_card|debit_card para
+// abrir o terminal já na modalidade escolhida. Pix/Voucher não têm pré-seleção
+// via essa API, então caem no fluxo "point" (cliente escolhe no terminal).
+function usesPaymentIntent(paymentType) {
+  return paymentType === "credit_card" || paymentType === "debit_card";
+}
+
+// Normaliza o "state" da Payment Intents API para o status usado no PDV.
+function normalizePointIntentState(state) {
+  const s = (state || "").toString().toUpperCase();
+  if (s === "FINISHED") return "processed";
+  if (s === "CANCELED" || s === "ABANDONED") return "canceled";
+  if (s === "ERROR" || s === "REJECTED") return "failed";
+  if (s === "EXPIRED") return "expired";
+  // OPEN, ON_TERMINAL, PROCESSING, etc.
+  return "pending";
+}
+
 // GET config atual da Point + estado das credenciais.
 app.get("/api/point/config", async (req, res) => {
   try {
@@ -6189,53 +6209,74 @@ app.post("/api/point/orders", async (req, res) => {
     },
   });
 
-  // A Orders API aceita dois formatos para pagamento presencial:
-  //
-  // 1) type "point" + config.point.terminal_id — o cliente escolhe crédito/débito
-  //    no próprio terminal. NÃO aceita payment_method em transactions.payments[].
-  //
-  // 2) type "instore" + config.device.id — permite enviar payment_method
-  //    ({ type, installments }) para o terminal já abrir direto na modalidade
-  //    escolhida no PDV, pulando a tela de seleção de meio de pagamento.
-  //
-  // Usamos o formato (2) quando a forma define um paymentType (pré-seleção);
-  // caso contrário mantemos o formato (1) para o cliente escolher no terminal.
-  let mpBody;
-  if (paymentType) {
-    mpBody = {
-      type: "instore",
-      processing_mode: "automatic",
-      total_amount: parsedAmount.toFixed(2),
-      external_reference: externalReference,
-      transactions: {
-        payments: [
-          {
-            amount: parsedAmount.toFixed(2),
-            payment_method: {
-              type: paymentType, // "credit_card" | "debit_card" | "pix" | "voucher"
-              // installments é obrigatório apenas para crédito
-              ...(paymentType === "credit_card" ? { installments: parcelas } : {}),
-            },
-          },
-        ],
-      },
-      config: { device: { id: terminalId } },
+  // Para pré-selecionar a modalidade (crédito/débito) usamos a Payment Intents
+  // API (POST /point/integration-api/devices/{device_id}/payment-intents), que é
+  // a ÚNICA que aceita payment.type e faz o terminal abrir já na modalidade
+  // escolhida. A Orders API (type "point") não tem esse recurso.
+  if (usesPaymentIntent(paymentType)) {
+    const paymentBlock = { type: paymentType };
+    if (paymentType === "credit_card") {
+      paymentBlock.installments = parcelas;
+      paymentBlock.installments_cost = "seller";
+    }
+    const intentBody = {
+      amount: Math.round(parsedAmount * 100), // menor unidade da moeda (centavos)
       description: description || "Venda PDV",
+      additional_info: {
+        external_reference: externalReference,
+        print_on_terminal: printOnTerminal === "seller_ticket",
+      },
+      payment: paymentBlock,
     };
-  } else {
-    mpBody = {
-      type: "point",
-      external_reference: externalReference,
-      transactions: { payments: [{ amount: parsedAmount.toFixed(2) }] },
-      config: {
-        point: {
-          terminal_id: terminalId,
-          print_on_terminal: printOnTerminal || "no_ticket",
+
+    try {
+      const { data } = await mpClient().post(
+        `/point/integration-api/devices/${terminalId}/payment-intents`,
+        intentBody
+      );
+      const updated = await prisma.pointOrder.update({
+        where: { id: pointOrder.id },
+        data: {
+          mpOrderId: data.id, // guardamos o payment_intent_id em mpOrderId
+          status: normalizePointIntentState(data.state),
+          statusDetail: data.state || null,
+          rawPayload: JSON.stringify(data).slice(0, 4000),
         },
-      },
-      description: description || "Venda PDV",
-    };
+      });
+      return res.status(201).json({
+        id: updated.id,
+        mpOrderId: updated.mpOrderId,
+        externalReference: updated.externalReference,
+        terminalId: updated.terminalId,
+        amount: updated.amount,
+        status: updated.status,
+      });
+    } catch (error) {
+      const { status, message, details } = mpErrorPayload(error);
+      console.error("Erro ao criar payment intent Point no Mercado Pago:", status, JSON.stringify(details || message));
+      await prisma.pointOrder.update({
+        where: { id: pointOrder.id },
+        data: { status: "failed", statusDetail: message, rawPayload: JSON.stringify(details || {}).slice(0, 4000) },
+      });
+      return res.status(status).json({ error: message, details });
+    }
   }
+
+  // Fluxo padrão (Orders API, type "point"): o cliente escolhe a modalidade no
+  // terminal. Usado quando não há pré-seleção (ou para Pix/Voucher, que não têm
+  // pré-seleção via Payment Intents API).
+  const mpBody = {
+    type: "point",
+    external_reference: externalReference,
+    transactions: { payments: [{ amount: parsedAmount.toFixed(2) }] },
+    config: {
+      point: {
+        terminal_id: terminalId,
+        print_on_terminal: printOnTerminal || "no_ticket",
+      },
+    },
+    description: description || "Venda PDV",
+  };
 
   // Dados de integração opcionais (parceiro/integrador).
   if (process.env.MP_INTEGRATOR_ID || process.env.MP_PLATFORM_ID) {
@@ -6288,6 +6329,25 @@ app.get("/api/point/orders/:id", async (req, res) => {
       return res.json(serializePointOrder(pointOrder));
     }
 
+    // Caminho Payment Intents API (modalidade pré-selecionada: crédito/débito).
+    if (usesPaymentIntent(pointOrder.paymentType)) {
+      try {
+        const { data } = await mpClient().get(`/point/integration-api/payment-intents/${pointOrder.mpOrderId}`);
+        const updated = await prisma.pointOrder.update({
+          where: { id: pointOrder.id },
+          data: {
+            status: normalizePointIntentState(data.state),
+            statusDetail: data.state || null,
+            mpPaymentId: data.payment?.id ? String(data.payment.id) : pointOrder.mpPaymentId,
+            rawPayload: JSON.stringify(data).slice(0, 4000),
+          },
+        });
+        return res.json(serializePointOrder(updated));
+      } catch (mpError) {
+        return res.json(serializePointOrder(pointOrder));
+      }
+    }
+
     try {
       const { data } = await mpClient().get(`/v1/orders/${pointOrder.mpOrderId}`);
       const payment = data.transactions?.payments?.[0] || null;
@@ -6332,7 +6392,12 @@ app.post("/api/point/orders/:id/cancel", async (req, res) => {
     if (!pointOrder) return res.status(404).json({ error: "Order não encontrada." });
     if (pointOrder.mpOrderId) {
       try {
-        await mpClient().post(`/v1/orders/${pointOrder.mpOrderId}/cancel`);
+        if (usesPaymentIntent(pointOrder.paymentType)) {
+          // Payment Intents API: cancelamento via DELETE no device.
+          await mpClient().delete(`/point/integration-api/devices/${pointOrder.terminalId}/payment-intents/${pointOrder.mpOrderId}`);
+        } else {
+          await mpClient().post(`/v1/orders/${pointOrder.mpOrderId}/cancel`);
+        }
       } catch (mpError) {
         const { status, message, details } = mpErrorPayload(mpError);
         // Se já estiver processada/cancelada, o MP retorna erro; propaga informação.
