@@ -5049,7 +5049,7 @@ app.put("/api/pdv-formas-pagamento/:id", async (req, res) => {
     const data = {};
     if (ativo !== undefined) data.ativo = ativo;
     if (pointEnabled !== undefined) data.pointEnabled = !!pointEnabled;
-    if (pointType !== undefined) data.pointType = pointType || null; // "credit_card" | "debit_card" | null
+    if (pointType !== undefined) data.pointType = pointType || null; // "credit_card" | "debit_card" | "pix" | "voucher" | null
     const forma = await prisma.pdvFormaPagamento.update({
       where: { id: parseInt(req.params.id) },
       data,
@@ -6190,13 +6190,23 @@ app.post("/api/point/orders", async (req, res) => {
   });
 
   // Corpo conforme a Orders API atual para Point (type: "point").
-  // Regras validadas pela API: print_on_terminal DEVE ser string ("no_ticket" | "seller_ticket" | "buyer_ticket")
-  // e NÃO é permitido enviar payment_method dentro de transactions.payments[]. O tipo (crédito/débito)
-  // é escolhido pelo cliente no próprio terminal.
+  // print_on_terminal DEVE ser string ("no_ticket" | "seller_ticket" | "buyer_ticket").
+  // Quando a forma de pagamento define um tipo (paymentType), enviamos payment_method para
+  // que o terminal já abra direto na modalidade escolhida no PDV (crédito/débito/pix/voucher),
+  // pulando a tela de seleção de meio de pagamento. Assim o processo fica único de ponta a ponta.
+  const payment = { amount: parsedAmount.toFixed(2) };
+  if (paymentType) {
+    payment.payment_method = {
+      type: paymentType, // "credit_card" | "debit_card" | "pix" | "voucher"
+      // installments é obrigatório apenas para crédito
+      ...(paymentType === "credit_card" ? { installments: parcelas } : {}),
+    };
+  }
+
   const mpBody = {
     type: "point",
     external_reference: externalReference,
-    transactions: { payments: [{ amount: parsedAmount.toFixed(2) }] },
+    transactions: { payments: [payment] },
     config: {
       point: {
         terminal_id: terminalId,
