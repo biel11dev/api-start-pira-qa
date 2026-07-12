@@ -6189,32 +6189,53 @@ app.post("/api/point/orders", async (req, res) => {
     },
   });
 
-  // Corpo conforme a Orders API atual para Point (type: "point").
-  // print_on_terminal DEVE ser string ("no_ticket" | "seller_ticket" | "buyer_ticket").
-  // Quando a forma de pagamento define um tipo (paymentType), enviamos payment_method para
-  // que o terminal já abra direto na modalidade escolhida no PDV (crédito/débito/pix/voucher),
-  // pulando a tela de seleção de meio de pagamento. Assim o processo fica único de ponta a ponta.
-  const payment = { amount: parsedAmount.toFixed(2) };
+  // A Orders API aceita dois formatos para pagamento presencial:
+  //
+  // 1) type "point" + config.point.terminal_id — o cliente escolhe crédito/débito
+  //    no próprio terminal. NÃO aceita payment_method em transactions.payments[].
+  //
+  // 2) type "instore" + config.device.id — permite enviar payment_method
+  //    ({ type, installments }) para o terminal já abrir direto na modalidade
+  //    escolhida no PDV, pulando a tela de seleção de meio de pagamento.
+  //
+  // Usamos o formato (2) quando a forma define um paymentType (pré-seleção);
+  // caso contrário mantemos o formato (1) para o cliente escolher no terminal.
+  let mpBody;
   if (paymentType) {
-    payment.payment_method = {
-      type: paymentType, // "credit_card" | "debit_card" | "pix" | "voucher"
-      // installments é obrigatório apenas para crédito
-      ...(paymentType === "credit_card" ? { installments: parcelas } : {}),
+    mpBody = {
+      type: "instore",
+      processing_mode: "automatic",
+      total_amount: parsedAmount.toFixed(2),
+      external_reference: externalReference,
+      transactions: {
+        payments: [
+          {
+            amount: parsedAmount.toFixed(2),
+            payment_method: {
+              type: paymentType, // "credit_card" | "debit_card" | "pix" | "voucher"
+              // installments é obrigatório apenas para crédito
+              ...(paymentType === "credit_card" ? { installments: parcelas } : {}),
+            },
+          },
+        ],
+      },
+      config: { device: { id: terminalId } },
+      description: description || "Venda PDV",
+    };
+  } else {
+    mpBody = {
+      type: "point",
+      external_reference: externalReference,
+      transactions: { payments: [{ amount: parsedAmount.toFixed(2) }] },
+      config: {
+        point: {
+          terminal_id: terminalId,
+          print_on_terminal: printOnTerminal || "no_ticket",
+        },
+      },
+      description: description || "Venda PDV",
     };
   }
-
-  const mpBody = {
-    type: "point",
-    external_reference: externalReference,
-    transactions: { payments: [payment] },
-    config: {
-      point: {
-        terminal_id: terminalId,
-        print_on_terminal: printOnTerminal || "no_ticket",
-      },
-    },
-    description: description || "Venda PDV",
-  };
 
   // Dados de integração opcionais (parceiro/integrador).
   if (process.env.MP_INTEGRATOR_ID || process.env.MP_PLATFORM_ID) {
