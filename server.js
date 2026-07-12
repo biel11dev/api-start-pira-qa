@@ -1460,10 +1460,30 @@ app.delete("/api/estoque_prod/:id", async (req, res) => {
 app.post("/api/verify-password", async (req, res) => {
   try {
     const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).json({ error: "Usuário e senha são obrigatórios" });
+    if (!password) {
+      return res.status(400).json({ error: "Senha é obrigatória" });
     }
-    const user = await prisma.user.findUnique({ where: { username } });
+
+    // Identifica o usuário preferencialmente pelo token JWT (enviado no header).
+    // Assim não depende do valor de "username" enviado pelo frontend, que pode
+    // conter o nome de exibição em vez do login.
+    let user = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      try {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, SECRET_KEY);
+        user = await prisma.user.findUnique({ where: { id: decoded.userId } });
+      } catch (tokenErr) {
+        // Token ausente/expirado: cai no fallback por username abaixo.
+      }
+    }
+
+    // Fallback: identifica pelo username informado no corpo da requisição.
+    if (!user && username) {
+      user = await prisma.user.findUnique({ where: { username } });
+    }
+
     if (!user) {
       return res.status(401).json({ error: "Usuário não encontrado" });
     }
