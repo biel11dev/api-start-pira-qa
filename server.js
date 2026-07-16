@@ -6428,6 +6428,126 @@ app.patch("/api/point/orders/:id", async (req, res) => {
   }
 });
 
+/* -------------------------------------------------------------------------
+ * PIX ONLINE (QR na tela do PDV)
+ * Diferente da maquininha: gera um pagamento Pix via /v1/payments e retorna o
+ * QR Code (imagem base64 + copia e cola) para exibir na tela. O PDV faz polling
+ * até o Mercado Pago aprovar. Reutiliza o model PointOrder (terminalId fixo
+ * "PIX_ONLINE", paymentType "pix_online", mpPaymentId = id do pagamento MP).
+ * ------------------------------------------------------------------------- */
+
+// POST cria uma cobrança Pix online e retorna o QR para exibir na tela.
+app.post("/api/point/pix", async (req, res) => {
+  const { amount, description } = req.body;
+  const parsedAmount = Number(amount);
+
+  if (!process.env.MP_ACCESS_TOKEN) return res.status(503).json({ error: "MP_ACCESS_TOKEN não configurado no servidor." });
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: "Valor inválido para o pagamento." });
+
+  // Identifica o operador pelo token JWT (quando presente).
+  let operatorName = req.body.operator || null;
+  try {
+    const authHeader = req.headers.authorization;
+    if (!operatorName && authHeader?.startsWith("Bearer ")) {
+      const decoded = jwt.verify(authHeader.split(" ")[1], SECRET_KEY);
+      const user = await prisma.user.findUnique({ where: { id: decoded.userId }, select: { name: true, username: true } });
+      if (user) operatorName = user.name || user.username;
+    }
+  } catch { /* token opcional */ }
+
+  const externalReference = buildExternalReference();
+  const descricao = description || "Venda PDV (Pix)";
+
+  // Registra a intenção localmente antes de enviar ao Mercado Pago.
+  const pointOrder = await prisma.pointOrder.create({
+    data: {
+      externalReference,
+      terminalId: "PIX_ONLINE",
+      amount: parsedAmount,
+      paymentType: "pix_online",
+      description: descricao,
+      status: "created",
+      operator: operatorName,
+    },
+  });
+
+  const expiracaoMin = parseInt(process.env.PIX_EXPIRACAO_MINUTOS || "30", 10) || 30;
+  const expiracao = new Date(Date.now() + expiracaoMin * 60 * 1000);
+  const body = {
+    transaction_amount: Number(parsedAmount.toFixed(2)),
+    description: descricao,
+    payment_method_id: "pix",
+    external_reference: externalReference,
+    date_of_expiration: expiracao.toISOString().replace("Z", "-00:00"),
+    payer: {
+      email: req.body.payerEmail || "cliente@startpira.com.br",
+      first_name: "Cliente",
+    },
+  };
+  if (process.env.MP_WEBHOOK_URL) body.notification_url = process.env.MP_WEBHOOK_URL;
+
+  try {
+    const { data } = await mpClient().post("/v1/payments", body, {
+      headers: { "X-Idempotency-Key": crypto.randomUUID() },
+    });
+    const tx = data?.point_of_interaction?.transaction_data || {};
+    await prisma.pointOrder.update({
+      where: { id: pointOrder.id },
+      data: {
+        mpPaymentId: String(data.id),
+        status: normalizePointStatus(data.status),
+        statusDetail: data.status_detail || null,
+        rawPayload: JSON.stringify({ id: data.id, status: data.status }).slice(0, 4000),
+      },
+    });
+    res.status(201).json({
+      id: pointOrder.id,
+      status: normalizePointStatus(data.status),
+      amount: parsedAmount,
+      qrCode: tx.qr_code || null,            // Pix copia e cola
+      qrCodeBase64: tx.qr_code_base64 || null, // imagem do QR (base64)
+      ticketUrl: tx.ticket_url || null,
+      expiresAt: data.date_of_expiration || null,
+    });
+  } catch (error) {
+    const { status, message, details } = mpErrorPayload(error);
+    console.error("Erro ao criar Pix online no Mercado Pago:", status, JSON.stringify(details || message));
+    await prisma.pointOrder.update({
+      where: { id: pointOrder.id },
+      data: { status: "failed", statusDetail: message, rawPayload: JSON.stringify(details || {}).slice(0, 4000) },
+    }).catch(() => {});
+    res.status(status).json({ error: message, details });
+  }
+});
+
+// GET consulta o status do Pix online (polling do PDV).
+app.get("/api/point/pix/:id", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
+
+  const pointOrder = await prisma.pointOrder.findUnique({ where: { id } });
+  if (!pointOrder) return res.status(404).json({ error: "Pagamento não encontrado." });
+
+  // Já aprovado anteriormente.
+  if (pointOrder.status === "processed") return res.json({ id, status: "processed" });
+  if (!pointOrder.mpPaymentId) return res.json({ id, status: pointOrder.status });
+
+  try {
+    const { data } = await mpClient().get(`/v1/payments/${pointOrder.mpPaymentId}`);
+    const status = normalizePointStatus(data.status);
+    if (status !== pointOrder.status) {
+      await prisma.pointOrder.update({
+        where: { id },
+        data: { status, statusDetail: data.status_detail || null },
+      }).catch(() => {});
+    }
+    res.json({ id, status, statusDetail: data.status_detail || null });
+  } catch (error) {
+    const { status, message, details } = mpErrorPayload(error);
+    res.status(status).json({ error: message, details });
+  }
+});
+
 // Valida a assinatura (x-signature) das notificações webhook do Mercado Pago.
 function validatePointWebhookSignature(req) {
   const secret = process.env.MP_WEBHOOK_SECRET;
