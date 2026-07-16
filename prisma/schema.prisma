@@ -87,6 +87,7 @@ model Product {
   name      String
   quantity  Int
   unit      String
+  baseUnit  String?  // unidade unitária (base = 1) do produto; null = automática (menor unidade cadastrada)
   categoryId Int?
   category   Category? @relation(fields: [categoryId], references: [id])
 

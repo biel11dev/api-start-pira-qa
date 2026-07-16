@@ -969,6 +969,36 @@ app.get("/api/followup/historico/:estoqueId", async (req, res) => {
   }
 });
 
+// Monta um mapa { unitName -> objeto de equivalência } a partir da tabela global.
+async function buildEqMap(client) {
+  const all = await client.unitEquivalence.findMany();
+  const map = {};
+  all.forEach((e) => { map[e.unitName] = e; });
+  return map;
+}
+
+// Retorna quantas "unidades base globais" uma unidade representa (não cadastradas = 1).
+function unitValue(eqMap, unit) {
+  return eqMap[unit]?.value ?? 1;
+}
+
+// Resolve a unidade base (unitária = 1) de um produto.
+// Usa product.baseUnit quando definido; caso contrário deduz a menor unidade
+// cadastrada no estoque do produto (menor "value" nas equivalências globais).
+async function resolveProductBaseUnit(client, productId, eqMap, explicitBaseUnit) {
+  if (explicitBaseUnit) return explicitBaseUnit;
+  const rows = await client.estoque.findMany({ where: { productId }, select: { unit: true } });
+  let best = null;
+  let bestVal = Infinity;
+  for (const r of rows) {
+    const eq = eqMap[r.unit];
+    if (eq?.isFractional) continue; // unidades fracionais (Dose/Taça) não servem de base
+    const val = eq?.value ?? 1; // unidades não cadastradas valem 1 (ex.: "Unidade", "Lata")
+    if (val < bestVal) { bestVal = val; best = r.unit; }
+  }
+  return best || "Unidade";
+}
+
 // Conversão de unidades - ex: 1 Fardo (12un) → 12 Unidades
 app.post("/api/estoque_prod/converter", async (req, res) => {
   try {
@@ -992,8 +1022,12 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
       return res.status(404).json({ error: "Item não encontrado no estoque." });
     }
 
-    if (estoqueItem.unit === "Unidade") {
-      return res.status(400).json({ error: "Este item já está em Unidades, não é possível converter." });
+    // Determinar a unidade base (unitária) do produto
+    const eqMap = await buildEqMap(prisma);
+    const baseUnit = await resolveProductBaseUnit(prisma, estoqueItem.productId, eqMap, estoqueItem.product?.baseUnit);
+
+    if (estoqueItem.unit === baseUnit) {
+      return res.status(400).json({ error: `Este item já está na unidade base ("${baseUnit}"), não é possível converter.` });
     }
 
     if (estoqueItem.quantity < parsedQty) {
@@ -1002,19 +1036,17 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
       });
     }
 
-    // Buscar fator de conversão
-    const equivalence = await prisma.unitEquivalence.findUnique({
-      where: { unitName: estoqueItem.unit }
-    });
-    if (!equivalence) {
+    // Fator de conversão relativo à unidade base (ex.: Fardo(12) → Lata(1) = 12)
+    const factor = unitValue(eqMap, estoqueItem.unit) / unitValue(eqMap, baseUnit);
+    if (!(factor > 1)) {
       return res.status(400).json({ 
-        error: `Equivalência não definida para "${estoqueItem.unit}". Cadastre a equivalência primeiro.` 
+        error: `Não é possível converter "${estoqueItem.unit}" para a unidade base "${baseUnit}". Verifique as equivalências cadastradas.` 
       });
     }
 
-    const unitsGenerated = parsedQty * equivalence.value;
-    const unitValueSell = estoqueItem.value / equivalence.value;
-    const unitValueCost = estoqueItem.valuecusto / equivalence.value;
+    const unitsGenerated = parsedQty * factor;
+    const unitValueSell = estoqueItem.value / factor;
+    const unitValueCost = estoqueItem.valuecusto / factor;
 
     const result = await prisma.$transaction(async (tx) => {
       // 1. Diminuir quantidade do item original
@@ -1034,14 +1066,14 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
           quantity: -parsedQty,
           previousStock: previousStock,
           newStock: newStock,
-          description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x Unidade`,
+          description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x ${baseUnit}`,
           referenceType: 'Conversion'
         }
       });
 
-      // 2. Verificar se já existe registro em Unidade para este produto
+      // 2. Verificar se já existe registro na unidade base para este produto
       const existingUnitStock = await tx.estoque.findFirst({
-        where: { productId: estoqueItem.productId, unit: "Unidade" }
+        where: { productId: estoqueItem.productId, unit: baseUnit }
       });
 
       let unitEstoqueItem;
@@ -1061,7 +1093,7 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
             quantity: unitsGenerated,
             previousStock: prevUnitStock,
             newStock: newUnitStock,
-            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x Unidade`,
+            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x ${baseUnit}`,
             referenceType: 'Conversion'
           }
         });
@@ -1071,7 +1103,7 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
             productId: estoqueItem.productId,
             name: estoqueItem.name,
             quantity: unitsGenerated,
-            unit: "Unidade",
+            unit: baseUnit,
             value: Math.round(unitValueSell * 100) / 100,
             valuecusto: Math.round(unitValueCost * 100) / 100,
             categoria_Id: estoqueItem.categoria_Id
@@ -1085,7 +1117,7 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
             quantity: unitsGenerated,
             previousStock: 0,
             newStock: unitsGenerated,
-            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x Unidade (novo registro)`,
+            description: `Conversão: ${parsedQty}x ${estoqueItem.unit} → ${unitsGenerated}x ${baseUnit} (novo registro)`,
             referenceType: 'Conversion'
           }
         });
@@ -1093,8 +1125,8 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
 
       return {
         origin: { id: estoqueItem.id, name: estoqueItem.name, unit: estoqueItem.unit, removed: parsedQty, remaining: newStock },
-        destination: { id: unitEstoqueItem.id, name: estoqueItem.name, unit: "Unidade", added: unitsGenerated, total: unitEstoqueItem.quantity },
-        conversionFactor: equivalence.value
+        destination: { id: unitEstoqueItem.id, name: estoqueItem.name, unit: baseUnit, added: unitsGenerated, total: unitEstoqueItem.quantity },
+        conversionFactor: factor
       };
     });
 
@@ -1128,30 +1160,32 @@ app.post("/api/estoque_prod/converter-reverso", async (req, res) => {
       return res.status(404).json({ error: "Item não encontrado no estoque." });
     }
 
-    if (estoqueItem.unit !== "Unidade") {
-      return res.status(400).json({ error: "Este item não está em Unidades. Use a conversão normal." });
+    // Determinar a unidade base (unitária) do produto
+    const eqMap = await buildEqMap(prisma);
+    const baseUnit = await resolveProductBaseUnit(prisma, estoqueItem.productId, eqMap, estoqueItem.product?.baseUnit);
+
+    if (estoqueItem.unit !== baseUnit) {
+      return res.status(400).json({ error: `Este item não está na unidade base ("${baseUnit}"). Use a conversão normal.` });
     }
 
-    // Buscar fator de conversão da unidade de destino
-    const equivalence = await prisma.unitEquivalence.findUnique({
-      where: { unitName: targetUnit }
-    });
-    if (!equivalence) {
+    // Fator de conversão da unidade de destino relativo à base (ex.: Fardo(12) sobre Lata(1) = 12)
+    const factor = unitValue(eqMap, targetUnit) / unitValue(eqMap, baseUnit);
+    if (!(factor > 1)) {
       return res.status(400).json({
-        error: `Equivalência não definida para "${targetUnit}". Cadastre a equivalência primeiro.`
+        error: `Não é possível empacotar "${baseUnit}" em "${targetUnit}". Verifique as equivalências cadastradas.`
       });
     }
 
-    const unitsNeeded = parsedQty * equivalence.value;
+    const unitsNeeded = parsedQty * factor;
 
     if (estoqueItem.quantity < unitsNeeded) {
       return res.status(400).json({
-        error: `Unidades insuficientes. Necessário: ${unitsNeeded} un. Disponível: ${estoqueItem.quantity} un.`
+        error: `Unidades insuficientes. Necessário: ${unitsNeeded} ${baseUnit}. Disponível: ${estoqueItem.quantity} ${baseUnit}.`
       });
     }
 
-    const packedValueSell = estoqueItem.value * equivalence.value;
-    const packedValueCost = estoqueItem.valuecusto * equivalence.value;
+    const packedValueSell = estoqueItem.value * factor;
+    const packedValueCost = estoqueItem.valuecusto * factor;
 
     const result = await prisma.$transaction(async (tx) => {
       // 1. Diminuir unidades do item original
@@ -1170,7 +1204,7 @@ app.post("/api/estoque_prod/converter-reverso", async (req, res) => {
           quantity: -unitsNeeded,
           previousStock: previousStock,
           newStock: newStock,
-          description: `Conversão reversa: ${unitsNeeded}x Unidade → ${parsedQty}x ${targetUnit}`,
+          description: `Conversão reversa: ${unitsNeeded}x ${baseUnit} → ${parsedQty}x ${targetUnit}`,
           referenceType: 'Conversion'
         }
       });
@@ -1197,7 +1231,7 @@ app.post("/api/estoque_prod/converter-reverso", async (req, res) => {
             quantity: parsedQty,
             previousStock: prevPackedStock,
             newStock: newPackedStock,
-            description: `Conversão reversa: ${unitsNeeded}x Unidade → ${parsedQty}x ${targetUnit}`,
+            description: `Conversão reversa: ${unitsNeeded}x ${baseUnit} → ${parsedQty}x ${targetUnit}`,
             referenceType: 'Conversion'
           }
         });
@@ -1221,16 +1255,16 @@ app.post("/api/estoque_prod/converter-reverso", async (req, res) => {
             quantity: parsedQty,
             previousStock: 0,
             newStock: parsedQty,
-            description: `Conversão reversa: ${unitsNeeded}x Unidade → ${parsedQty}x ${targetUnit} (novo registro)`,
+            description: `Conversão reversa: ${unitsNeeded}x ${baseUnit} → ${parsedQty}x ${targetUnit} (novo registro)`,
             referenceType: 'Conversion'
           }
         });
       }
 
       return {
-        origin: { id: estoqueItem.id, name: estoqueItem.name, unit: "Unidade", removed: unitsNeeded, remaining: newStock },
+        origin: { id: estoqueItem.id, name: estoqueItem.name, unit: baseUnit, removed: unitsNeeded, remaining: newStock },
         destination: { id: packedEstoqueItem.id, name: estoqueItem.name, unit: targetUnit, added: parsedQty, total: packedEstoqueItem.quantity },
-        conversionFactor: equivalence.value
+        conversionFactor: factor
       };
     });
 
@@ -1559,7 +1593,7 @@ app.get("/api/products/:id", async (req, res) => {
 // Atualizar POST e PUT de produtos para incluir categoria com parent no retorno
 app.post("/api/products", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1587,7 +1621,8 @@ app.post("/api/products", async (req, res) => {
         unit, 
         value: parsedValue, 
         valuecusto: parsedValueCusto,
-        categoryId: categoryId || null
+        categoryId: categoryId || null,
+        baseUnit: baseUnit || null
       },
       include: { 
         category: {
@@ -1606,7 +1641,7 @@ app.post("/api/products", async (req, res) => {
 
 app.put("/api/products/:id", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1635,7 +1670,8 @@ app.put("/api/products/:id", async (req, res) => {
         unit, 
         value: parsedValue, 
         valuecusto: parsedValueCusto,
-        categoryId: categoryId || null
+        categoryId: categoryId || null,
+        baseUnit: baseUnit || null
       },
       include: { 
         category: {
