@@ -88,6 +88,7 @@ model Product {
   quantity  Int
   unit      String
   baseUnit  String?  // unidade unitária (base = 1) do produto; null = automática (menor unidade cadastrada)
+  pdvHiddenUnits String[] @default([]) // unidades que NÃO aparecem no PDV para este produto (ex.: "Fardo" na Coca-Cola)
   categoryId Int?
   category   Category? @relation(fields: [categoryId], references: [id])
 

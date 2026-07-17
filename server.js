@@ -1563,7 +1563,8 @@ app.get("/api/products", async (req, res) => {
           include: {
             parent: true
           }
-        }
+        },
+        estoqueItems: { select: { unit: true } }
       }
     });
     res.json(products);
@@ -1581,7 +1582,8 @@ app.get("/api/products/:id", async (req, res) => {
           include: {
             parent: true
           }
-        }
+        },
+        estoqueItems: { select: { unit: true } }
       }
     });
     res.json(product || { error: "Produto não encontrado" });
@@ -1593,7 +1595,7 @@ app.get("/api/products/:id", async (req, res) => {
 // Atualizar POST e PUT de produtos para incluir categoria com parent no retorno
 app.post("/api/products", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1622,7 +1624,8 @@ app.post("/api/products", async (req, res) => {
         value: parsedValue, 
         valuecusto: parsedValueCusto,
         categoryId: categoryId || null,
-        baseUnit: baseUnit || null
+        baseUnit: baseUnit || null,
+        pdvHiddenUnits: Array.isArray(pdvHiddenUnits) ? pdvHiddenUnits : []
       },
       include: { 
         category: {
@@ -1641,7 +1644,7 @@ app.post("/api/products", async (req, res) => {
 
 app.put("/api/products/:id", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1671,7 +1674,8 @@ app.put("/api/products/:id", async (req, res) => {
         value: parsedValue, 
         valuecusto: parsedValueCusto,
         categoryId: categoryId || null,
-        baseUnit: baseUnit || null
+        baseUnit: baseUnit || null,
+        ...(pdvHiddenUnits !== undefined ? { pdvHiddenUnits: Array.isArray(pdvHiddenUnits) ? pdvHiddenUnits : [] } : {})
       },
       include: { 
         category: {
