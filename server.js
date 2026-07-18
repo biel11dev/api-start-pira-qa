@@ -1601,10 +1601,6 @@ app.post("/api/products", async (req, res) => {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
     }
 
-    const parsedQuantity = parseInt(quantity, 10);
-    if (isNaN(parsedQuantity)) {
-      return res.status(400).json({ error: "Quantidade deve ser um número válido." });
-    }
 
     const parsedValue = parseFloat(value, 10);
     if (isNaN(parsedValue)) {
