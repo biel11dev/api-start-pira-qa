@@ -1595,12 +1595,11 @@ app.get("/api/products/:id", async (req, res) => {
 // Atualizar POST e PUT de produtos para incluir categoria com parent no retorno
 app.post("/api/products", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits } = req.body;
+    const { name, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits } = req.body;
 
-    if (!name || !quantity || !unit) {
-      return res.status(400).json({ error: "Todos os campos são obrigatórios." });
+    if (!name || !unit) {
+      return res.status(400).json({ error: "Nome e unidade são obrigatórios." });
     }
-
 
     const parsedValue = parseFloat(value, 10);
     if (isNaN(parsedValue)) {
@@ -1615,7 +1614,6 @@ app.post("/api/products", async (req, res) => {
     const newProduct = await prisma.product.create({
       data: { 
         name, 
-        quantity: parsedQuantity, 
         unit, 
         value: parsedValue, 
         valuecusto: parsedValueCusto,
