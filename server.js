@@ -73,6 +73,24 @@ const rotaParaModulo = (rota) => {
   return "outro";
 };
 
+// Identifica o dispositivo/origem da ação a partir do header customizado ou do User-Agent
+const resolveDispositivo = (clientHeader, userAgent) => {
+  // Cliente customizado enviado pelo app mobile (X-Client)
+  if (clientHeader) {
+    const c = String(clientHeader).toLowerCase();
+    if (c.includes("mobile") || c.includes("app") || c.includes("expo")) return "Aplicativo Mobile";
+  }
+  if (!userAgent) return "Desconhecido";
+  const ua = userAgent.toLowerCase();
+  if (ua.includes("expo") || ua.includes("okhttp") || ua.includes("cfnetwork") || ua.includes("start_pira") || ua.includes("startpira")) return "Aplicativo Mobile";
+  if (ua.includes("android")) return "Android (navegador)";
+  if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ios")) return "iPhone/iPad (navegador)";
+  if (ua.includes("windows")) return "Windows (navegador)";
+  if (ua.includes("macintosh") || ua.includes("mac os")) return "Mac (navegador)";
+  if (ua.includes("linux")) return "Linux (navegador)";
+  return "Outro navegador";
+};
+
 // Middleware de auditoria - registra ações no banco
 const auditoriaMiddleware = async (req, res, next) => {
   // Ignora rotas de auditoria para evitar loop
@@ -133,6 +151,9 @@ const auditoriaMiddleware = async (req, res, next) => {
 
       const descricao = `${acao} ${req.path}` + (res.statusCode >= 400 ? ` [ERRO ${res.statusCode}]` : "");
 
+      const userAgent = req.headers["user-agent"] || null;
+      const dispositivo = resolveDispositivo(req.headers["x-client"], userAgent);
+
       await prisma.auditoria.create({
         data: {
           modulo,
@@ -143,6 +164,8 @@ const auditoriaMiddleware = async (req, res, next) => {
           userName,
           ip: req.ip || req.connection?.remoteAddress || null,
           payload,
+          dispositivo,
+          userAgent: userAgent ? userAgent.substring(0, 500) : null,
         },
       });
     } catch (err) {
@@ -2604,6 +2627,97 @@ app.delete("/api/categories/:id", async (req, res) => {
   }
 });
 
+// Baixa estoque de um item aplicando conversão automática de unidade irmã (mesma lógica dos itens de venda).
+// Usado tanto para itens normais quanto para componentes de composição.
+async function baixarEstoqueComConversao(tx, estoqueId, needed, eqMap, saleId, descricao, rotuloErro) {
+  const estoqueItem = await tx.estoque.findUnique({ where: { id: estoqueId } });
+  if (!estoqueItem) return;
+  // Descartáveis (contabiliza=false) não baixam estoque
+  if (estoqueItem.contabiliza === false) return;
+
+  let currentStock = estoqueItem.quantity;
+
+  if (currentStock < needed) {
+    const deficit = needed - currentStock;
+    const siblings = await tx.estoque.findMany({
+      where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
+    });
+    const currentEq = eqMap[estoqueItem.unit];
+    let conversionDone = false;
+    for (const sibling of siblings) {
+      let ratio = null;
+      if (currentEq?.isFractional && currentEq?.fractionalValue > 0) {
+        // Unidade fracional (ex: Dose): 1 irmão-pai → fractionalValue doses
+        ratio = currentEq.fractionalValue;
+      } else {
+        const sibEq = eqMap[sibling.unit];
+        const currentVal = currentEq?.value || 1;
+        const sibVal = sibEq?.value || 1;
+        if (sibVal > currentVal) ratio = sibVal / currentVal;
+      }
+      if (!ratio || ratio <= 0) continue;
+      const neededSiblings = Math.ceil(deficit / ratio);
+      if (sibling.quantity < neededSiblings) continue;
+
+      const gainedCurrentUnits = neededSiblings * ratio;
+      const siblingPrevStock = sibling.quantity;
+      const siblingNewStock = sibling.quantity - neededSiblings;
+
+      await tx.estoque.update({ where: { id: sibling.id }, data: { quantity: siblingNewStock } });
+      await tx.stockMovement.create({
+        data: {
+          estoqueId: sibling.id,
+          type: 'CONVERSION',
+          quantity: -neededSiblings,
+          previousStock: siblingPrevStock,
+          newStock: siblingNewStock,
+          description: `Conversão automática p/ Venda #${saleId}: ${neededSiblings}x ${sibling.unit} → ${gainedCurrentUnits}x ${estoqueItem.unit} (${descricao})`,
+          referenceId: saleId,
+          referenceType: 'Sale'
+        }
+      });
+
+      const stockAfterConversion = currentStock + gainedCurrentUnits;
+      await tx.estoque.update({ where: { id: estoqueItem.id }, data: { quantity: stockAfterConversion } });
+      await tx.stockMovement.create({
+        data: {
+          estoqueId: estoqueItem.id,
+          type: 'CONVERSION',
+          quantity: gainedCurrentUnits,
+          previousStock: currentStock,
+          newStock: stockAfterConversion,
+          description: `Conversão automática de ${neededSiblings}x ${sibling.unit} → ${gainedCurrentUnits}x ${estoqueItem.unit} p/ Venda #${saleId}`,
+          referenceId: saleId,
+          referenceType: 'Sale'
+        }
+      });
+
+      currentStock = stockAfterConversion;
+      conversionDone = true;
+      break;
+    }
+
+    if (!conversionDone) {
+      throw new Error(`Estoque insuficiente para ${rotuloErro || `"${estoqueItem.name}"`} (${estoqueItem.unit}). Disponível: ${estoqueItem.quantity}, Necessário: ${needed}.`);
+    }
+  }
+
+  const newStock = currentStock - needed;
+  await tx.estoque.update({ where: { id: estoqueItem.id }, data: { quantity: newStock } });
+  await tx.stockMovement.create({
+    data: {
+      estoqueId: estoqueItem.id,
+      type: 'SALE',
+      quantity: -needed,
+      previousStock: currentStock,
+      newStock: newStock,
+      description: descricao,
+      referenceId: saleId,
+      referenceType: 'Sale'
+    }
+  });
+}
+
 // Rota para criar uma nova venda (PDV) com baixa de estoque
 app.post('/api/sales', async (req, res) => {
   try {
@@ -2891,26 +3005,17 @@ app.post('/api/sales', async (req, res) => {
           where: { id: { in: allOpcaoIds }, estoqueId: { not: null } }
         });
         for (const opcao of opcoes) {
-          const estoqueComp = await tx.estoque.findUnique({ where: { id: opcao.estoqueId } });
-          if (!estoqueComp) continue;
           const needed = item.quantity; // 1 unidade do componente por item vendido
-          if (estoqueComp.quantity < needed) {
-            throw new Error(`Estoque insuficiente para o componente "${opcao.nome}" (${estoqueComp.name}). Disponível: ${estoqueComp.quantity}, Necessário: ${needed}.`);
-          }
-          const newQty = estoqueComp.quantity - needed;
-          await tx.estoque.update({ where: { id: opcao.estoqueId }, data: { quantity: newQty } });
-          await tx.stockMovement.create({
-            data: {
-              estoqueId: opcao.estoqueId,
-              type: 'SALE',
-              quantity: -needed,
-              previousStock: estoqueComp.quantity,
-              newStock: newQty,
-              description: `Venda #${sale.id} - Componente "${opcao.nome}" p/ ${item.name} (${needed}x)`,
-              referenceId: sale.id,
-              referenceType: 'Sale'
-            }
-          });
+          // Aplica conversão automática de unidade irmã (ex.: baixa 1 Dose convertendo 1 Garrafa)
+          await baixarEstoqueComConversao(
+            tx,
+            opcao.estoqueId,
+            needed,
+            eqMap,
+            sale.id,
+            `Venda #${sale.id} - Componente "${opcao.nome}" p/ ${item.name} (${needed}x)`,
+            `o componente "${opcao.nome}"`
+          );
         }
       }
 
@@ -3897,7 +4002,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
         // Se não existe meta específica, retornar valores padrão do funcionário
         const employee = await prisma.employee.findUnique({
           where: { id: employeeId },
-          select: { valorHora: true, metaHoras: true, bonificacao: true }
+          select: { valorHora: true, metaHoras: true, bonificacao: true, metasExtras: true }
         });
         
         return res.json({
@@ -3934,7 +4039,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
         // Se não existe meta específica, retornar valores padrão do funcionário
         const employee = await prisma.employee.findUnique({
           where: { id: employeeId },
-          select: { valorHora: true, metaHoras: true, bonificacao: true }
+          select: { valorHora: true, metaHoras: true, bonificacao: true, metasExtras: true }
         });
         
         return res.json({
@@ -3974,7 +4079,7 @@ app.get("/api/employee-weekly-meta/:employeeId", async (req, res) => {
 // POST - Criar ou atualizar meta semanal
 app.post("/api/employee-weekly-meta", async (req, res) => {
   try {
-    const { employeeId, weekStart, metaHoras, bonificacao, valorHora, year, month } = req.body;
+    const { employeeId, weekStart, metaHoras, bonificacao, valorHora, year, month, metasExtras } = req.body;
 
     if (!employeeId || !weekStart || metaHoras === undefined || bonificacao === undefined || valorHora === undefined) {
       return res.status(400).json({ error: "Dados incompletos" });
@@ -4009,7 +4114,8 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
           weekEnd: weekEndDate,
           metaHoras: parseFloat(metaHoras),
           bonificacao: parseFloat(bonificacao),
-          valorHora: parseFloat(valorHora)
+          valorHora: parseFloat(valorHora),
+          metasExtras: metasExtrasJson
         }
       });
     } else {
@@ -4023,7 +4129,8 @@ app.post("/api/employee-weekly-meta", async (req, res) => {
           month: month || weekStartDate.getMonth() + 1,
           metaHoras: parseFloat(metaHoras),
           bonificacao: parseFloat(bonificacao),
-          valorHora: parseFloat(valorHora)
+          valorHora: parseFloat(valorHora),
+          metasExtras: metasExtrasJson
         }
       });
     }
@@ -4373,6 +4480,7 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
     let userId = null;
     let userName = null;
     let isAdmin = false;
+    let isFuncionario = false;
     try {
       const authHeader = req.headers.authorization;
       if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -4382,6 +4490,7 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
         const user = await prisma.user.findUnique({ where: { id: userId } });
         userName = user?.name || user?.username || null;
         isAdmin = user?.acessos === true;
+        isFuncionario = user?.funcionario === true;
       }
     } catch (e) { /* ignora */ }
 
@@ -4441,6 +4550,31 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
       });
     }
 
+    // Se é funcionário, lançar em GASTOS BAR (tipo VALE) para deduzir do total a pagar da semana no Ponto
+    let gastoBar = null;
+    if (isFuncionario && userName) {
+      let funcionarioId = null;
+      try {
+        const emp = await prisma.employee.findFirst({ where: { name: userName } });
+        funcionarioId = emp?.id || null;
+      } catch (e) { /* nome pode não bater com um funcionário do Ponto */ }
+
+      const descVale = [
+        origensPreenchidas.length > 0 ? "Origem: " + origensPreenchidas.map((o) => o.nome).join(", ") : null,
+        observacao || null,
+      ].filter(Boolean).join(" | ") || "Vale em dinheiro";
+
+      gastoBar = await prisma.pdvGastoBar.create({
+        data: {
+          tipo: "VALE",
+          funcionario: userName,
+          funcionarioId,
+          descricao: descVale,
+          valorTotal: parseFloat(valor),
+        },
+      });
+    }
+
     // Registrar no sub-caixa aberto (se houver)
     const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
     if (caixaAberto) {
@@ -4481,7 +4615,7 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
       } catch (e) { console.error("Erro ao descontar origem (VALE):", e.message); }
     }
 
-    res.status(201).json({ movimento, despesaPessoal, isAdmin });
+    res.status(201).json({ movimento, despesaPessoal, gastoBar, isAdmin, isFuncionario });
   } catch (error) {
     console.error("Erro ao registrar vale:", error);
     res.status(500).json({ error: "Erro ao registrar vale", details: error.message });
@@ -5799,10 +5933,13 @@ app.get("/api/pdv-gastos-bar", async (req, res) => {
     const semanasMap = {};
     for (const g of gastos) {
       const weekKey = getWeekKey(g.createdAt);
-      if (!semanasMap[weekKey]) semanasMap[weekKey] = { semana: weekKey, produtos: [], descontos: [], totalProdutos: 0, totalDescontos: 0, total: 0 };
+      if (!semanasMap[weekKey]) semanasMap[weekKey] = { semana: weekKey, produtos: [], descontos: [], vales: [], totalProdutos: 0, totalDescontos: 0, totalVales: 0, total: 0 };
       if (g.tipo === "PRODUTO") {
         semanasMap[weekKey].produtos.push(g);
         semanasMap[weekKey].totalProdutos += g.valorTotal;
+      } else if (g.tipo === "VALE") {
+        semanasMap[weekKey].vales.push(g);
+        semanasMap[weekKey].totalVales += g.valorTotal;
       } else {
         semanasMap[weekKey].descontos.push(g);
         semanasMap[weekKey].totalDescontos += g.valorTotal;
@@ -5874,9 +6011,10 @@ app.get("/api/pdv-gastos-bar/resumo", async (req, res) => {
 
     const porFunc = {};
     for (const g of gastos) {
-      if (!porFunc[g.funcionario]) porFunc[g.funcionario] = { funcionario: g.funcionario, totalProdutos: 0, totalDescontos: 0, total: 0, itens: [] };
+      if (!porFunc[g.funcionario]) porFunc[g.funcionario] = { funcionario: g.funcionario, totalProdutos: 0, totalDescontos: 0, totalVales: 0, total: 0, itens: [] };
       porFunc[g.funcionario].itens.push(g);
       if (g.tipo === "PRODUTO") porFunc[g.funcionario].totalProdutos += g.valorTotal;
+      else if (g.tipo === "VALE") porFunc[g.funcionario].totalVales += g.valorTotal;
       else porFunc[g.funcionario].totalDescontos += g.valorTotal;
       porFunc[g.funcionario].total += g.valorTotal;
     }
@@ -5887,16 +6025,39 @@ app.get("/api/pdv-gastos-bar/resumo", async (req, res) => {
   }
 });
 
+// Total de Gastos Bar de um funcionário em um período (usado p/ deduzir do total a pagar no Ponto)
+app.get("/api/pdv-gastos-bar/funcionario/:nome", async (req, res) => {
+  try {
+    const nome = decodeURIComponent(req.params.nome);
+    const { startDate, endDate } = req.query;
+    const where = { funcionario: nome };
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) where.createdAt.gte = new Date(startDate);
+      if (endDate) where.createdAt.lte = new Date(endDate);
+    }
+    const gastos = await prisma.pdvGastoBar.findMany({ where, orderBy: { createdAt: "desc" } });
+    const total = gastos.reduce((s, g) => s + (g.valorTotal || 0), 0);
+    const totalProdutos = gastos.filter((g) => g.tipo === "PRODUTO").reduce((s, g) => s + (g.valorTotal || 0), 0);
+    const totalVales = gastos.filter((g) => g.tipo === "VALE").reduce((s, g) => s + (g.valorTotal || 0), 0);
+    const totalDescontos = gastos.filter((g) => g.tipo === "DESCONTO").reduce((s, g) => s + (g.valorTotal || 0), 0);
+    res.json({ funcionario: nome, total, totalProdutos, totalVales, totalDescontos, itens: gastos });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar gastos do funcionário", details: error.message });
+  }
+});
+
 // ROTAS DE AUDITORIA
 app.get("/api/auditoria", async (req, res) => {
   try {
-    const { modulo, acao, userId, userName, dataInicio, dataFim, page = 1, limit = 50 } = req.query;
+    const { modulo, acao, userId, userName, dataInicio, dataFim, dispositivo, page = 1, limit = 50 } = req.query;
     const where = {};
 
     if (modulo) where.modulo = modulo;
     if (acao) where.acao = acao;
     if (userId) where.userId = parseInt(userId);
     if (userName) where.userName = { contains: userName, mode: "insensitive" };
+    if (dispositivo) where.dispositivo = dispositivo;
     if (dataInicio || dataFim) {
       where.createdAt = {};
       if (dataInicio) where.createdAt.gte = new Date(dataInicio);
@@ -5955,6 +6116,21 @@ app.get("/api/auditoria/usuarios", async (req, res) => {
     res.json(usuarios);
   } catch (error) {
     res.status(500).json({ error: "Erro ao buscar usuários da auditoria", details: error.message });
+  }
+});
+
+// Retorna lista de dispositivos distintos para filtro
+app.get("/api/auditoria/dispositivos", async (req, res) => {
+  try {
+    const dispositivos = await prisma.auditoria.findMany({
+      select: { dispositivo: true },
+      distinct: ["dispositivo"],
+      where: { dispositivo: { not: null } },
+      orderBy: { dispositivo: "asc" },
+    });
+    res.json(dispositivos.map((d) => d.dispositivo));
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar dispositivos", details: error.message });
   }
 });
 

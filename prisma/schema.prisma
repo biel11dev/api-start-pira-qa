@@ -335,12 +335,15 @@ model Auditoria {
   userName    String?  // Nome do usuário para consulta rápida
   ip          String?  // IP do requisitante
   payload     String?  // JSON com dados enviados (body resumido)
+  dispositivo String?  // Dispositivo/origem da acao (Aplicativo Mobile, navegador, etc.)
+  userAgent   String?  // User-Agent bruto do requisitante
   createdAt   DateTime @default(now())
 
   @@index([modulo])
   @@index([userId])
   @@index([createdAt])
   @@index([acao])
+  @@index([dispositivo])
 }
 
 model AuditoriaConfig {
