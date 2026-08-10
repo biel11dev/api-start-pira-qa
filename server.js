@@ -6028,9 +6028,11 @@ app.get("/api/pdv-gastos-bar/resumo", async (req, res) => {
 // Total de Gastos Bar de um funcionário em um período (usado p/ deduzir do total a pagar no Ponto)
 app.get("/api/pdv-gastos-bar/funcionario/:nome", async (req, res) => {
   try {
-    const nome = decodeURIComponent(req.params.nome);
+    const nome = decodeURIComponent(req.params.nome).trim();
     const { startDate, endDate } = req.query;
-    const where = { funcionario: nome };
+    // Match case-insensitive: o nome do Employee pode diferir em caixa/espaços
+    // do funcionario gravado no PdvGastoBar (vindo do userName do PDV).
+    const where = { funcionario: { equals: nome, mode: "insensitive" } };
     if (startDate || endDate) {
       where.createdAt = {};
       if (startDate) where.createdAt.gte = new Date(startDate);
