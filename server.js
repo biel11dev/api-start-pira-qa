@@ -605,7 +605,7 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
 // Entrada de estoque - seleciona do catálogo, verifica se já existe, incrementa ou cria
 app.post("/api/estoque_prod/entrada", async (req, res) => {
   try {
-    const { productId, quantity, unit } = req.body;
+    const { productId, quantity, unit, value, valuecusto } = req.body;
 
     if (!productId || !quantity || !unit) {
       return res.status(400).json({ error: "productId, quantity e unit são obrigatórios." });
@@ -625,6 +625,19 @@ app.post("/api/estoque_prod/entrada", async (req, res) => {
       return res.status(404).json({ error: "Produto não encontrado no catálogo." });
     }
 
+    // Resolver valor de venda/custo desta unidade: body (editável) > unitPrices[unit] (cadastro) > produto
+    const unitPriceCfg = catalogProduct.unitPrices && typeof catalogProduct.unitPrices === "object"
+      ? catalogProduct.unitPrices[unit]
+      : null;
+    const bodyValue = value !== undefined && value !== null && value !== "" ? parseFloat(value) : null;
+    const bodyCusto = valuecusto !== undefined && valuecusto !== null && valuecusto !== "" ? parseFloat(valuecusto) : null;
+    const entradaValue = (bodyValue != null && !isNaN(bodyValue))
+      ? bodyValue
+      : (unitPriceCfg && unitPriceCfg.value != null ? Number(unitPriceCfg.value) : catalogProduct.value);
+    const entradaCusto = (bodyCusto != null && !isNaN(bodyCusto))
+      ? bodyCusto
+      : (unitPriceCfg && unitPriceCfg.cost != null ? Number(unitPriceCfg.cost) : catalogProduct.valuecusto);
+
     // Verificar se já existe no estoque com mesmo productId e mesma unidade
     const existingStock = await prisma.estoque.findFirst({
       where: { productId: parseInt(productId), unit: unit }
@@ -642,8 +655,8 @@ app.post("/api/estoque_prod/entrada", async (req, res) => {
           where: { id: existingStock.id },
           data: { 
             quantity: newStock,
-            value: catalogProduct.value,
-            valuecusto: catalogProduct.valuecusto
+            value: entradaValue,
+            valuecusto: entradaCusto
           },
           include: { product: true, category: { include: { parent: true } } }
         });
@@ -668,8 +681,8 @@ app.post("/api/estoque_prod/entrada", async (req, res) => {
             name: catalogProduct.name,
             quantity: parsedQuantity,
             unit: unit,
-            value: catalogProduct.value,
-            valuecusto: catalogProduct.valuecusto,
+            value: entradaValue,
+            valuecusto: entradaCusto,
             categoria_Id: catalogProduct.categoryId || null
           },
           include: { product: true, category: { include: { parent: true } } }
@@ -1618,7 +1631,7 @@ app.get("/api/products/:id", async (req, res) => {
 // Atualizar POST e PUT de produtos para incluir categoria com parent no retorno
 app.post("/api/products", async (req, res) => {
   try {
-    const { name, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits } = req.body;
+    const { name, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits, unitPrices } = req.body;
 
     if (!name || !unit) {
       return res.status(400).json({ error: "Nome e unidade são obrigatórios." });
@@ -1642,7 +1655,8 @@ app.post("/api/products", async (req, res) => {
         valuecusto: parsedValueCusto,
         categoryId: categoryId || null,
         baseUnit: baseUnit || null,
-        pdvHiddenUnits: Array.isArray(pdvHiddenUnits) ? pdvHiddenUnits : []
+        pdvHiddenUnits: Array.isArray(pdvHiddenUnits) ? pdvHiddenUnits : [],
+        ...(unitPrices && typeof unitPrices === "object" ? { unitPrices } : {})
       },
       include: { 
         category: {
@@ -1661,7 +1675,7 @@ app.post("/api/products", async (req, res) => {
 
 app.put("/api/products/:id", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits, unitPrices } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1692,7 +1706,8 @@ app.put("/api/products/:id", async (req, res) => {
         valuecusto: parsedValueCusto,
         categoryId: categoryId || null,
         baseUnit: baseUnit || null,
-        ...(pdvHiddenUnits !== undefined ? { pdvHiddenUnits: Array.isArray(pdvHiddenUnits) ? pdvHiddenUnits : [] } : {})
+        ...(pdvHiddenUnits !== undefined ? { pdvHiddenUnits: Array.isArray(pdvHiddenUnits) ? pdvHiddenUnits : [] } : {}),
+        ...(unitPrices !== undefined ? { unitPrices: unitPrices && typeof unitPrices === "object" ? unitPrices : null } : {})
       },
       include: { 
         category: {
@@ -4958,6 +4973,29 @@ app.post("/api/pdv-premio", async (req, res) => {
           userName,
         },
       });
+    }
+
+    // Descontar de cada origem de saldo (BAG / MÁQUINA / CAIXA) quando informada
+    const ORIGENS_VALIDAS_PREMIO = ["BAG", "MÁQUINA", "CAIXA"];
+    for (const og of origensPreenchidas.filter(o => ORIGENS_VALIDAS_PREMIO.includes(o.nome))) {
+      try {
+        const origemReg = await prisma.pdvOrigemSaldo.findUnique({ where: { nome: og.nome } });
+        if (origemReg) {
+          const saldoAntes = origemReg.saldo;
+          const saldoDepois = saldoAntes - parseFloat(og.valor);
+          await prisma.$transaction([
+            prisma.pdvOrigemSaldo.update({ where: { nome: og.nome }, data: { saldo: saldoDepois } }),
+            prisma.pdvOrigemSaldoMovimento.create({
+              data: {
+                origemId: origemReg.id, tipo: "SAIDA", valor: parseFloat(og.valor),
+                saldoAntes, saldoDepois,
+                descricao: `PRÊMIO - ${observacao || "Prêmio de máquina"}`,
+                userId, userName,
+              },
+            }),
+          ]);
+        }
+      } catch (e) { console.error("Erro ao descontar origem (PRÊMIO):", e.message); }
     }
 
     res.status(201).json(premio);
