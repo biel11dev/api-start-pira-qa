@@ -1677,14 +1677,10 @@ app.put("/api/products/:id", async (req, res) => {
   try {
     const { name, quantity, unit, value, valuecusto, categoryId, baseUnit, pdvHiddenUnits, unitPrices } = req.body;
 
-    if (!name || !quantity || !unit) {
+    if (!name || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
     }
 
-    const parsedQuantity = parseInt(quantity, 10);
-    if (isNaN(parsedQuantity)) {
-      return res.status(400).json({ error: "Quantidade deve ser um número válido." });
-    }
 
     const parsedValue = parseFloat(value, 10);
     if (isNaN(parsedValue)) {
@@ -1700,7 +1696,6 @@ app.put("/api/products/:id", async (req, res) => {
       where: { id: parseInt(req.params.id) },
       data: { 
         name, 
-        quantity: parsedQuantity, 
         unit, 
         value: parsedValue, 
         valuecusto: parsedValueCusto,
