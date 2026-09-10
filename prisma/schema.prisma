@@ -562,6 +562,8 @@ model ComposicaoProduto {
   multiplo    Boolean           @default(false) // true = checkbox (múltipla escolha)
   minOpcoes   Int               @default(1)
   maxOpcoes   Int               @default(1)
+  porcoesGratis Int             @default(0) // Nº de porções sem custo (montagem). 0 = desativado
+  valorAdicional Float          @default(0) // Valor por porção além das grátis (montagem)
   ordem       Int               @default(0)
   opcoes      ComposicaoOpcao[]
   estoque     Estoque           @relation(fields: [estoqueId], references: [id], onDelete: Cascade)

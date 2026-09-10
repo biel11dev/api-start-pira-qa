@@ -3563,13 +3563,14 @@ app.get('/api/composicoes/:estoqueId', async (req, res) => {
 
 app.post('/api/composicoes', async (req, res) => {
   try {
-    const { estoqueId, nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem } = req.body;
+    const { estoqueId, nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem, porcoesGratis, valorAdicional } = req.body;
     if (!estoqueId || !nome) return res.status(400).json({ error: 'estoqueId e nome são obrigatórios' });
     const comp = await prisma.composicaoProduto.create({
       data: {
         estoqueId: parseInt(estoqueId), nome, descricao: descricao || null,
         obrigatorio: obrigatorio !== false, multiplo: !!multiplo,
         minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1,
+        porcoesGratis: parseInt(porcoesGratis) || 0, valorAdicional: parseFloat(valorAdicional) || 0,
         ordem: parseInt(ordem) || 0
       },
       include: { opcoes: true }
@@ -3582,10 +3583,10 @@ app.post('/api/composicoes', async (req, res) => {
 
 app.put('/api/composicoes/:id', async (req, res) => {
   try {
-    const { nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem } = req.body;
+    const { nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem, porcoesGratis, valorAdicional } = req.body;
     const comp = await prisma.composicaoProduto.update({
       where: { id: parseInt(req.params.id) },
-      data: { nome, descricao, obrigatorio: !!obrigatorio, multiplo: !!multiplo, minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1, ordem: parseInt(ordem) || 0 },
+      data: { nome, descricao, obrigatorio: !!obrigatorio, multiplo: !!multiplo, minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1, porcoesGratis: parseInt(porcoesGratis) || 0, valorAdicional: parseFloat(valorAdicional) || 0, ordem: parseInt(ordem) || 0 },
       include: { opcoes: true }
     });
     res.json(comp);
