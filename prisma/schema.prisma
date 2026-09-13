@@ -269,6 +269,7 @@ model SaleItem {
   quantity    Float
   unitPrice   Float
   total       Float
+  unit        String? // unidade de medida comercializada na venda (ex.: "Unidade", "Lata", "Dose")
   composicao  String? // JSON com opções selecionadas pelo cliente
   sale        Sale    @relation(fields: [saleId], references: [id])
   estoque     Estoque @relation(fields: [estoqueId], references: [id])

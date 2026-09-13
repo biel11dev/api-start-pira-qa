@@ -870,14 +870,56 @@ function getISOWeekString(date = new Date()) {
   return `${d.getFullYear()}-W${String(weekNum).padStart(2, "0")}`;
 }
 
+// Verifica se existe uma unidade de medida MAIOR (irmã) do mesmo produto com estoque
+// disponível para conversão automática. Nesse caso o item NÃO está realmente em falta,
+// pois a próxima venda converte a unidade maior sob demanda.
+async function temUnidadeMaiorConvertivel(estoqueItem) {
+  try {
+    if (!estoqueItem?.productId) return false;
+    const siblings = await prisma.estoque.findMany({
+      where: { productId: estoqueItem.productId, id: { not: estoqueItem.id }, quantity: { gt: 0 } }
+    });
+    if (siblings.length === 0) return false;
+    const eqs = await prisma.unitEquivalence.findMany();
+    const eqMap = {};
+    eqs.forEach(e => { eqMap[e.unitName] = e; });
+    const currentEq = eqMap[estoqueItem.unit];
+    for (const sib of siblings) {
+      let ratio = null;
+      if (currentEq?.isFractional && currentEq?.fractionalValue > 0) {
+        ratio = currentEq.fractionalValue;
+      } else {
+        const sibEq = eqMap[sib.unit];
+        const currentVal = currentEq?.value || 1;
+        const sibVal = sibEq?.value || 1;
+        if (sibVal > currentVal) ratio = sibVal / currentVal;
+      }
+      if (ratio && ratio > 0 && sib.quantity >= 1) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // Verifica se o estoque atingiu o mínimo e cria/atualiza a ListaCompras
 async function criarListaComprasSeNecessario(estoqueId, novaQuantidade) {
   try {
     const minimo = await prisma.estoqueMinimo.findUnique({ where: { estoqueId } });
     if (!minimo) return;
-    const estoque = await prisma.estoque.findUnique({ where: { id: estoqueId }, select: { name: true } });
+    const estoque = await prisma.estoque.findUnique({ where: { id: estoqueId }, select: { id: true, name: true, productId: true, unit: true } });
     if (!estoque) return;
     if (novaQuantidade <= minimo.quantidadeMinima) {
+      // Só é "falta" real se NÃO houver unidade de medida maior do mesmo produto para converter.
+      // Se houver, o produto continua disponível (conversão automática na venda) → não registrar falta.
+      const podeConverter = await temUnidadeMaiorConvertivel(estoque);
+      if (podeConverter) {
+        const pendente = await prisma.listaCompras.findFirst({ where: { estoqueId, status: "PENDENTE" } });
+        if (pendente) {
+          await prisma.listaCompras.update({ where: { id: pendente.id }, data: { status: "CONCLUIDO", concluidoEm: new Date() } });
+        }
+        return;
+      }
       const pendente = await prisma.listaCompras.findFirst({ where: { estoqueId, status: "PENDENTE" } });
       if (pendente) {
         await prisma.listaCompras.update({ where: { id: pendente.id }, data: { quantidadeAtual: novaQuantidade } });
@@ -2868,6 +2910,7 @@ app.post('/api/sales', async (req, res) => {
               quantity: item.quantity,
               unitPrice: item.price,
               total: item.price * item.quantity,
+              unit: item.unit || null,
               ...(item.composicao ? { composicao: item.composicao } : {})
             }))
           }
@@ -3070,17 +3113,19 @@ app.post('/api/sales', async (req, res) => {
     try {
       const caixaAberto = await prisma.pdvCaixaControle.findFirst({ where: { status: "ABERTO" } });
       if (caixaAberto) {
-        // Não registrar vendas 100% pendentes (fiado) como entrada imediata no caixa
+        // Não registrar vendas 100% pendentes (fiado) nem em Vale como entrada imediata no caixa.
+        // Vale não entra no caixa: é descontado do pagamento do funcionário no fim da semana (Gastos Bar).
         const isPendenteTotal = !splitPay && paymentMethod?.toLowerCase().includes("pendente");
+        const isValeTotal = !splitPay && ((vale && vale.password) || paymentMethod?.toLowerCase().includes("vale"));
         let valorEntrada = splitPay
           ? splitPay
-              .filter(s => s.forma !== "pendente")
+              .filter(s => s.forma !== "pendente" && (s.forma || "").toLowerCase() !== "vale")
               .reduce((acc, s) => acc + (parseFloat(s.valor) || 0), 0)
-          : isPendenteTotal ? 0 : saleTotal;
+          : (isPendenteTotal || isValeTotal) ? 0 : saleTotal;
 
         // Com saque: o cliente também paga o valor sacado na máquina, então a entrada
         // reflete o total cobrado (produtos + taxa + saque). A saída do dinheiro é lançada abaixo.
-        if (saqueValorNum > 0 && !splitPay && !isPendenteTotal) {
+        if (saqueValorNum > 0 && !splitPay && !isPendenteTotal && !isValeTotal) {
           valorEntrada += saqueValorNum;
         }
 
@@ -3119,6 +3164,62 @@ app.post('/api/sales', async (req, res) => {
       }
     } catch (caixaErr) {
       console.error("Erro ao registrar transação no caixa (não crítico):", caixaErr.message);
+    }
+
+    // 5b. Registrar lançamentos no Gastos Bar (venda em Vale => PRODUTO; desconto dado => DESCONTO).
+    // Atribuído ao operador logado no PDV. Funciona para web, mobile e NET de forma centralizada.
+    try {
+      const funcionarioGB = operatorName || "Operador";
+      const gastoBarCreates = [];
+
+      // Vale: registra os itens consumidos (proporcional ao valor pago em vale)
+      const valorVale = splitPay
+        ? parseFloat((splitPay.find(s => (s.forma || "").toLowerCase() === "vale") || {}).valor || 0)
+        : (((vale && vale.password) || paymentMethod?.toLowerCase().includes("vale")) ? parseFloat(finalTotal || total) || 0 : 0);
+
+      if (valorVale > 0 && Array.isArray(items) && items.length > 0) {
+        const totalItens = items.reduce((s, it) => s + ((parseFloat(it.price) || 0) * (parseFloat(it.quantity) || 0)), 0);
+        if (totalItens > 0) {
+          const proporcao = Math.min(valorVale / totalItens, 1);
+          const valeParcial = proporcao < 0.999;
+          for (const it of items) {
+            const qtd = parseFloat(it.quantity) || 0;
+            const valorBase = (parseFloat(it.price) || 0) * qtd;
+            const valorTotalItem = parseFloat((valorBase * proporcao).toFixed(2));
+            if (!qtd || !valorTotalItem) continue;
+            gastoBarCreates.push(prisma.pdvGastoBar.create({
+              data: {
+                tipo: "PRODUTO",
+                funcionario: funcionarioGB,
+                descricao: valeParcial ? `${it.name} (Vale parcial)` : it.name,
+                quantidade: qtd,
+                valorUnitario: parseFloat((valorTotalItem / qtd).toFixed(2)),
+                valorTotal: valorTotalItem,
+                saleId: result.id,
+              },
+            }));
+          }
+        }
+      }
+
+      // Desconto concedido pelo operador na venda
+      const valorDesconto = discount && parseFloat(discount.valor) > 0 ? parseFloat(discount.valor) : 0;
+      if (valorDesconto > 0) {
+        const nomesProdutos = items.map(it => `${it.quantity}x ${it.name}`).join(", ");
+        gastoBarCreates.push(prisma.pdvGastoBar.create({
+          data: {
+            tipo: "DESCONTO",
+            funcionario: funcionarioGB,
+            descricao: `Desconto na Venda #${result.id} — ${nomesProdutos}`,
+            valorTotal: valorDesconto,
+            saleId: result.id,
+          },
+        }));
+      }
+
+      if (gastoBarCreates.length > 0) await Promise.all(gastoBarCreates);
+    } catch (gbErr) {
+      console.error("Erro ao registrar Gastos Bar (não crítico):", gbErr.message);
     }
 
     // 6. Verificar estoque mínimo e atualizar ListaCompras para itens que baixaram estoque
