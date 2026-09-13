@@ -576,7 +576,7 @@ app.get("/api/estoque_prod", async (req, res) => {
       include: {
         product: true,
         category: { include: { parent: true } },
-        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } },
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } },
         _count: { select: { composicaoOpcoes: true } }
       }
     });
@@ -593,7 +593,7 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
       include: {
         product: true,
         category: { include: { parent: true } },
-        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
     res.json(product || { error: "Produto não encontrado" });
@@ -4662,9 +4662,10 @@ app.post("/api/pdv-caixa-vale", async (req, res) => {
       });
     }
 
-    // Se é funcionário, lançar em GASTOS BAR (tipo VALE) para deduzir do total a pagar da semana no Ponto
+    // Lançar em GASTOS BAR (tipo VALE) o vale em dinheiro pego no PDV, atribuído a quem
+    // realizou a ação (admin ou funcionário). Para funcionário é deduzido no Ponto.
     let gastoBar = null;
-    if (isFuncionario && userName) {
+    if (userName) {
       let funcionarioId = null;
       try {
         const emp = await prisma.employee.findFirst({ where: { name: userName } });
