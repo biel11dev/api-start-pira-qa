@@ -3679,13 +3679,14 @@ app.delete('/api/unit-equivalences/:unitName', async (req, res) => {
 // Rotas de opções devem vir ANTES das rotas com :id para evitar conflitos de roteamento
 app.put('/api/composicoes/opcoes/:id', async (req, res) => {
   try {
-    const { nome, valorExtra, disponivel, estoqueId, exclusivo, consomeQtd } = req.body;
+    const { nome, valorExtra, disponivel, estoqueId, exclusivo, consomeQtd, base } = req.body;
     const updateData = {};
     if (nome !== undefined) updateData.nome = nome;
     if (valorExtra !== undefined) updateData.valorExtra = parseFloat(valorExtra) || 0;
     if (disponivel !== undefined) updateData.disponivel = disponivel !== false && disponivel !== 0;
     if (estoqueId !== undefined) updateData.estoqueId = estoqueId ? parseInt(estoqueId) : null;
     if (exclusivo !== undefined) updateData.exclusivo = !!exclusivo;
+    if (base !== undefined) updateData.base = !!base;
     if (consomeQtd !== undefined) updateData.consomeQtd = Math.max(1, parseInt(consomeQtd) || 1);
     const opcao = await prisma.composicaoOpcao.update({
       where: { id: parseInt(req.params.id) },
@@ -3769,7 +3770,7 @@ app.delete('/api/composicoes/:id', async (req, res) => {
 
 app.post('/api/composicoes/:id/opcoes', async (req, res) => {
   try {
-    const { nome, valorExtra, disponivel, estoqueId, exclusivo, consomeQtd } = req.body;
+    const { nome, valorExtra, disponivel, estoqueId, exclusivo, consomeQtd, base } = req.body;
     if (!nome) return res.status(400).json({ error: 'Nome da opção é obrigatório' });
     const opcao = await prisma.composicaoOpcao.create({
       data: {
@@ -3778,6 +3779,7 @@ app.post('/api/composicoes/:id/opcoes', async (req, res) => {
         valorExtra: parseFloat(valorExtra) || 0,
         disponivel: disponivel !== false,
         exclusivo: !!exclusivo,
+        base: !!base,
         consomeQtd: Math.max(1, parseInt(consomeQtd) || 1),
         ...(estoqueId ? { estoqueId: parseInt(estoqueId) } : {})
       },

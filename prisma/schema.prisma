@@ -586,6 +586,7 @@ model ComposicaoOpcao {
   valorExtra   Float             @default(0)
   disponivel   Boolean           @default(true)
   exclusivo    Boolean           @default(false) // true = ao selecionar, bloqueia as demais opções do grupo (ex.: Vibe 2L)
+  base         Boolean           @default(false) // true = componente fixo da variação: já vem selecionado e não pode ser removido
   consomeQtd   Int               @default(1) // quanto da quota do grupo cada unidade desta opção consome
   estoqueId    Int? // Vinculado ao item de estoque contabilizável
   estoque      Estoque?          @relation(fields: [estoqueId], references: [id], onDelete: SetNull)
