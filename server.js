@@ -272,7 +272,7 @@ app.post("/api/login", async (req, res) => {
     return res.status(401).json({ error: "Usuário ou senha inválidos" });
   }
 
-  const token = jwt.sign({ userId: user.id }, SECRET_KEY, { expiresIn: "1h" });
+  const token = jwt.sign({ userId: user.id }, SECRET_KEY, { expiresIn: "12h" });
   // Inclua as permissões do usuário no retorno
   res.json({
     token,
@@ -570,6 +570,33 @@ app.delete("/api/daily-readings/:id", async (req, res) => {
 });
 
 // ROTAS DE ESTOQUE
+// Um combo não tem estoque próprio: o disponível é derivado do estoque dos componentes.
+// Para cada grupo obrigatório, soma a quota que os componentes conseguem suprir
+// (qtd em estoque x consomeQtd) e divide pela quota exigida por combo (maxOpcoes).
+const calcularDisponibilidadeCombo = (item) => {
+  const grupos = (item.composicoes || []).filter((c) => c.obrigatorio);
+  if (grupos.length === 0) return 0;
+  let disponivel = Infinity;
+  for (const grupo of grupos) {
+    const quotaPorCombo = Math.max(1, grupo.maxOpcoes || 1);
+    const opcoes = (grupo.opcoes || []).filter((o) => o.disponivel && o.estoque);
+    const quotaDisponivel = opcoes.reduce(
+      (soma, o) => soma + (o.estoque.quantity || 0) * Math.max(1, o.consomeQtd || 1),
+      0
+    );
+    disponivel = Math.min(disponivel, Math.floor(quotaDisponivel / quotaPorCombo));
+  }
+  return disponivel === Infinity ? 0 : Math.max(0, disponivel);
+};
+
+// Combos expõem o disponível calculado em `quantity` para que todas as telas
+// (PDV, estoque, carrinho) enxerguem o mesmo número sem tratamento especial.
+const comEstoqueDeCombo = (item) => {
+  if (!item?.isCombo) return item;
+  const disponivel = calcularDisponibilidadeCombo(item);
+  return { ...item, quantity: disponivel, comboDisponivel: disponivel, quantidadePropria: item.quantity };
+};
+
 app.get("/api/estoque_prod", async (req, res) => {
   try {
     const produtos = await prisma.estoque.findMany({
@@ -580,7 +607,7 @@ app.get("/api/estoque_prod", async (req, res) => {
         _count: { select: { composicaoOpcoes: true } }
       }
     });
-    res.json(produtos);
+    res.json(produtos.map(comEstoqueDeCombo));
   } catch (error) {
     res.status(500).json({ error: "Erro ao buscar estoque", details: error.message });
   }
@@ -596,7 +623,7 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
         composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
-    res.json(product || { error: "Produto não encontrado" });
+    res.json(product ? comEstoqueDeCombo(product) : { error: "Produto não encontrado" });
   } catch (error) {
     res.status(500).json({ error: "Erro ao buscar produto", details: error.message });
   }
@@ -1500,7 +1527,7 @@ app.post("/api/estoque_prod", async (req, res) => {
 
 app.put("/api/estoque_prod/:id", async (req, res) => {
   try {
-    const { name, quantity, unit, value, valuecusto, categoryId, contabiliza, mostrarPdv } = req.body;
+    const { name, quantity, unit, value, valuecusto, categoryId, contabiliza, mostrarPdv, isCombo, comboNome } = req.body;
 
     if (!name || !quantity || !unit) {
       return res.status(400).json({ error: "Todos os campos são obrigatórios." });
@@ -1531,7 +1558,9 @@ app.put("/api/estoque_prod/:id", async (req, res) => {
         valuecusto: parsedValueCusto,
         categoria_Id: categoryId ? parseInt(categoryId) : null,
         ...(contabiliza !== undefined ? { contabiliza: Boolean(contabiliza) } : {}),
-        ...(mostrarPdv !== undefined ? { mostrarPdv: Boolean(mostrarPdv) } : {})
+        ...(mostrarPdv !== undefined ? { mostrarPdv: Boolean(mostrarPdv) } : {}),
+        ...(isCombo !== undefined ? { isCombo: Boolean(isCombo) } : {}),
+        ...(comboNome !== undefined ? { comboNome: comboNome || null } : {})
       },
       include: {
         product: true,
@@ -2681,6 +2710,28 @@ app.delete("/api/categories/:id", async (req, res) => {
 
 // Baixa estoque de um item aplicando conversão automática de unidade irmã (mesma lógica dos itens de venda).
 // Usado tanto para itens normais quanto para componentes de composição.
+// Aceita o formato legado ({ grupoId: [opcaoId] }) e o novo com quantidade
+// ({ grupoId: [{ id, qtd }] }), devolvendo sempre [{ opcaoId, qtd }].
+function parseSelecoesComposicao(composicaoJSON) {
+  let selections;
+  try { selections = JSON.parse(composicaoJSON); } catch { return []; }
+  if (!selections || typeof selections !== 'object') return [];
+  const escolhas = [];
+  for (const opcoes of Object.values(selections)) {
+    if (!Array.isArray(opcoes)) continue;
+    for (const opcao of opcoes) {
+      if (opcao && typeof opcao === 'object') {
+        const opcaoId = Number(opcao.id);
+        if (opcaoId) escolhas.push({ opcaoId, qtd: Math.max(1, parseInt(opcao.qtd, 10) || 1) });
+      } else {
+        const opcaoId = Number(opcao);
+        if (opcaoId) escolhas.push({ opcaoId, qtd: 1 });
+      }
+    }
+  }
+  return escolhas;
+}
+
 async function baixarEstoqueComConversao(tx, estoqueId, needed, eqMap, saleId, descricao, rotuloErro) {
   const estoqueItem = await tx.estoque.findUnique({ where: { id: estoqueId } });
   if (!estoqueItem) return;
@@ -2813,6 +2864,9 @@ app.post('/api/sales', async (req, res) => {
       }
       // Itens com contabiliza=false não precisam de verificação de estoque
       if (estoqueItem.contabiliza === false) continue;
+      // Combos não têm estoque próprio: a disponibilidade vem dos componentes,
+      // validados na baixa da composição dentro da transação.
+      if (estoqueItem.isCombo) continue;
       if (estoqueItem.quantity < item.quantity) {
         // Verificar se há conversão automática possível a partir de unidade irmã
         const deficit = item.quantity - estoqueItem.quantity;
@@ -2935,6 +2989,9 @@ app.post('/api/sales', async (req, res) => {
           continue; // pular atualização de estoque para descartáveis
         }
 
+        // Combos não baixam estoque próprio — só os componentes selecionados.
+        if (estoqueItem.isCombo) continue;
+
         // Se estoque insuficiente, tentar conversão automática de unidade irmã
         if (currentStock < item.quantity) {
           const deficit = item.quantity - currentStock;
@@ -3049,16 +3106,15 @@ app.post('/api/sales', async (req, res) => {
       // 2b. Dar baixa no estoque dos componentes de composição
       for (const item of items) {
         if (!item.composicao) continue;
-        let selections;
-        try { selections = JSON.parse(item.composicao); } catch { continue; }
-        // selections = { [composicaoId]: [opcaoId, ...] }
-        const allOpcaoIds = Object.values(selections).flat().map(Number).filter(Boolean);
-        if (allOpcaoIds.length === 0) continue;
+        const escolhas = parseSelecoesComposicao(item.composicao);
+        if (escolhas.length === 0) continue;
         const opcoes = await tx.composicaoOpcao.findMany({
-          where: { id: { in: allOpcaoIds }, estoqueId: { not: null } }
+          where: { id: { in: escolhas.map((e) => e.opcaoId) }, estoqueId: { not: null } }
         });
         for (const opcao of opcoes) {
-          const needed = item.quantity; // 1 unidade do componente por item vendido
+          const escolhida = escolhas.find((e) => e.opcaoId === opcao.id);
+          // Quantidade escolhida pelo cliente para este componente x itens vendidos
+          const needed = item.quantity * (escolhida?.qtd || 1);
           // Aplica conversão automática de unidade irmã (ex.: baixa 1 Dose convertendo 1 Garrafa)
           await baixarEstoqueComConversao(
             tx,
@@ -3225,8 +3281,8 @@ app.post('/api/sales', async (req, res) => {
     // 6. Verificar estoque mínimo e atualizar ListaCompras para itens que baixaram estoque
     try {
       for (const item of items) {
-        const estoqueItem = await prisma.estoque.findUnique({ where: { id: item.id }, select: { quantity: true, contabiliza: true } });
-        if (estoqueItem && estoqueItem.contabiliza !== false) {
+        const estoqueItem = await prisma.estoque.findUnique({ where: { id: item.id }, select: { quantity: true, contabiliza: true, isCombo: true } });
+        if (estoqueItem && estoqueItem.contabiliza !== false && !estoqueItem.isCombo) {
           await criarListaComprasSeNecessario(item.id, estoqueItem.quantity);
         }
       }
@@ -3623,12 +3679,14 @@ app.delete('/api/unit-equivalences/:unitName', async (req, res) => {
 // Rotas de opções devem vir ANTES das rotas com :id para evitar conflitos de roteamento
 app.put('/api/composicoes/opcoes/:id', async (req, res) => {
   try {
-    const { nome, valorExtra, disponivel, estoqueId } = req.body;
+    const { nome, valorExtra, disponivel, estoqueId, exclusivo, consomeQtd } = req.body;
     const updateData = {};
     if (nome !== undefined) updateData.nome = nome;
     if (valorExtra !== undefined) updateData.valorExtra = parseFloat(valorExtra) || 0;
     if (disponivel !== undefined) updateData.disponivel = disponivel !== false && disponivel !== 0;
     if (estoqueId !== undefined) updateData.estoqueId = estoqueId ? parseInt(estoqueId) : null;
+    if (exclusivo !== undefined) updateData.exclusivo = !!exclusivo;
+    if (consomeQtd !== undefined) updateData.consomeQtd = Math.max(1, parseInt(consomeQtd) || 1);
     const opcao = await prisma.composicaoOpcao.update({
       where: { id: parseInt(req.params.id) },
       data: updateData,
@@ -3664,7 +3722,7 @@ app.get('/api/composicoes/:estoqueId', async (req, res) => {
 
 app.post('/api/composicoes', async (req, res) => {
   try {
-    const { estoqueId, nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem, porcoesGratis, valorAdicional } = req.body;
+    const { estoqueId, nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem, porcoesGratis, valorAdicional, permiteQuantidade, exigeTotalExato } = req.body;
     if (!estoqueId || !nome) return res.status(400).json({ error: 'estoqueId e nome são obrigatórios' });
     const comp = await prisma.composicaoProduto.create({
       data: {
@@ -3672,6 +3730,7 @@ app.post('/api/composicoes', async (req, res) => {
         obrigatorio: obrigatorio !== false, multiplo: !!multiplo,
         minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1,
         porcoesGratis: parseInt(porcoesGratis) || 0, valorAdicional: parseFloat(valorAdicional) || 0,
+        permiteQuantidade: !!permiteQuantidade, exigeTotalExato: !!exigeTotalExato,
         ordem: parseInt(ordem) || 0
       },
       include: { opcoes: true }
@@ -3684,10 +3743,13 @@ app.post('/api/composicoes', async (req, res) => {
 
 app.put('/api/composicoes/:id', async (req, res) => {
   try {
-    const { nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem, porcoesGratis, valorAdicional } = req.body;
+    const { nome, descricao, obrigatorio, multiplo, minOpcoes, maxOpcoes, ordem, porcoesGratis, valorAdicional, permiteQuantidade, exigeTotalExato } = req.body;
+    const data = { nome, descricao, obrigatorio: !!obrigatorio, multiplo: !!multiplo, minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1, porcoesGratis: parseInt(porcoesGratis) || 0, valorAdicional: parseFloat(valorAdicional) || 0, ordem: parseInt(ordem) || 0 };
+    if (permiteQuantidade !== undefined) data.permiteQuantidade = !!permiteQuantidade;
+    if (exigeTotalExato !== undefined) data.exigeTotalExato = !!exigeTotalExato;
     const comp = await prisma.composicaoProduto.update({
       where: { id: parseInt(req.params.id) },
-      data: { nome, descricao, obrigatorio: !!obrigatorio, multiplo: !!multiplo, minOpcoes: parseInt(minOpcoes) || 1, maxOpcoes: parseInt(maxOpcoes) || 1, porcoesGratis: parseInt(porcoesGratis) || 0, valorAdicional: parseFloat(valorAdicional) || 0, ordem: parseInt(ordem) || 0 },
+      data,
       include: { opcoes: true }
     });
     res.json(comp);
@@ -3707,7 +3769,7 @@ app.delete('/api/composicoes/:id', async (req, res) => {
 
 app.post('/api/composicoes/:id/opcoes', async (req, res) => {
   try {
-    const { nome, valorExtra, disponivel, estoqueId } = req.body;
+    const { nome, valorExtra, disponivel, estoqueId, exclusivo, consomeQtd } = req.body;
     if (!nome) return res.status(400).json({ error: 'Nome da opção é obrigatório' });
     const opcao = await prisma.composicaoOpcao.create({
       data: {
@@ -3715,6 +3777,8 @@ app.post('/api/composicoes/:id/opcoes', async (req, res) => {
         nome,
         valorExtra: parseFloat(valorExtra) || 0,
         disponivel: disponivel !== false,
+        exclusivo: !!exclusivo,
+        consomeQtd: Math.max(1, parseInt(consomeQtd) || 1),
         ...(estoqueId ? { estoqueId: parseInt(estoqueId) } : {})
       },
       include: { estoque: { select: { id: true, name: true, quantity: true } } }
@@ -3785,6 +3849,26 @@ app.post('/api/composicoes/:id/opcao-estoque', async (req, res) => {
     res.status(201).json(result);
   } catch (error) {
     res.status(500).json({ error: 'Erro ao criar item de estoque e opção', details: error.message });
+  }
+});
+
+// Marca/desmarca um item de estoque como variação de venda (combo) e define o rótulo.
+app.patch('/api/estoque_prod/:id/combo', async (req, res) => {
+  try {
+    const { isCombo, comboNome } = req.body;
+    const data = {};
+    if (isCombo !== undefined) data.isCombo = Boolean(isCombo);
+    if (comboNome !== undefined) data.comboNome = comboNome || null;
+    const item = await prisma.estoque.update({
+      where: { id: parseInt(req.params.id) },
+      data,
+      include: {
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
+      }
+    });
+    res.json(comEstoqueDeCombo(item));
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao configurar combo', details: error.message });
   }
 });
 

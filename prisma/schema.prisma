@@ -115,6 +115,8 @@ model Estoque {
   valuecusto       Float
   contabiliza      Boolean             @default(true) // false = descartável (não baixa estoque; usa FollowUp)
   mostrarPdv       Boolean             @default(true) // false = não aparece na tela de venda do PDV
+  isCombo          Boolean             @default(false) // true = não é unidade de medida real, e sim uma variação de venda (conjunto de produtos)
+  comboNome        String? // rótulo exibido no PDV para a variação (ex.: "Combo", "Kit")
   stockMovements   StockMovement[]
   saleItems        SaleItem[]
   composicoes      ComposicaoProduto[]
@@ -565,6 +567,8 @@ model ComposicaoProduto {
   maxOpcoes   Int               @default(1)
   porcoesGratis Int             @default(0) // Nº de porções sem custo (montagem). 0 = desativado
   valorAdicional Float          @default(0) // Valor por porção além das grátis (montagem)
+  permiteQuantidade Boolean     @default(false) // true = PDV permite escolher a quantidade de cada opção (ex.: 2x Coco + 2x Maracujá)
+  exigeTotalExato   Boolean     @default(false) // true = a soma das quantidades precisa fechar exatamente maxOpcoes
   ordem       Int               @default(0)
   opcoes      ComposicaoOpcao[]
   estoque     Estoque           @relation(fields: [estoqueId], references: [id], onDelete: Cascade)
@@ -581,6 +585,8 @@ model ComposicaoOpcao {
   nome         String // Ex: "Jack Daniel's", "Gelo de Limão", "Red Bull"
   valorExtra   Float             @default(0)
   disponivel   Boolean           @default(true)
+  exclusivo    Boolean           @default(false) // true = ao selecionar, bloqueia as demais opções do grupo (ex.: Vibe 2L)
+  consomeQtd   Int               @default(1) // quanto da quota do grupo cada unidade desta opção consome
   estoqueId    Int? // Vinculado ao item de estoque contabilizável
   estoque      Estoque?          @relation(fields: [estoqueId], references: [id], onDelete: SetNull)
   createdAt    DateTime          @default(now())
