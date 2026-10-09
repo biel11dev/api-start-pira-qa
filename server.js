@@ -1104,6 +1104,8 @@ function irmaosConversiveis(estoqueItem, siblings, eqMap) {
   for (const sib of siblings) {
     const sibEq = eqMap[sib.unit];
     if (sibEq?.isFractional) continue;
+    // Combo é só uma variação de venda (sem estoque físico próprio): nunca serve de origem.
+    if (sib.isCombo) continue;
     let ratio = null;
     if (currentEq?.isFractional && currentEq?.fractionalValue > 0) {
       ratio = currentEq.fractionalValue;
