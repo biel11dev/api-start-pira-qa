@@ -571,8 +571,9 @@ app.delete("/api/daily-readings/:id", async (req, res) => {
 
 // ROTAS DE ESTOQUE
 // Um combo não tem estoque próprio: o disponível é derivado do estoque dos componentes.
-// Para cada grupo obrigatório, soma a quota que os componentes conseguem suprir
-// (qtd em estoque x consomeQtd) e divide pela quota exigida por combo (maxOpcoes).
+// Opções marcadas como `base` entram em TODO combo, então cada uma limita o disponível
+// individualmente (menor estoque manda). As demais são alternativas entre si e somam a
+// quota que conseguem suprir para preencher o que sobra de `maxOpcoes`.
 const calcularDisponibilidadeCombo = (item) => {
   const grupos = (item.composicoes || []).filter((c) => c.obrigatorio);
   if (grupos.length === 0) return 0;
@@ -580,11 +581,26 @@ const calcularDisponibilidadeCombo = (item) => {
   for (const grupo of grupos) {
     const quotaPorCombo = Math.max(1, grupo.maxOpcoes || 1);
     const opcoes = (grupo.opcoes || []).filter((o) => o.disponivel && o.estoque);
-    const quotaDisponivel = opcoes.reduce(
-      (soma, o) => soma + (o.estoque.quantity || 0) * Math.max(1, o.consomeQtd || 1),
-      0
-    );
-    disponivel = Math.min(disponivel, Math.floor(quotaDisponivel / quotaPorCombo));
+    const bases = opcoes.filter((o) => o.base);
+    const alternativas = opcoes.filter((o) => !o.base);
+
+    let limiteGrupo = Infinity;
+    for (const o of bases) {
+      const consumo = Math.max(1, o.consomeQtd || 1);
+      limiteGrupo = Math.min(limiteGrupo, Math.floor((o.estoque.quantity || 0) / consumo));
+    }
+
+    const quotaBase = bases.reduce((s, o) => s + Math.max(1, o.consomeQtd || 1), 0);
+    const quotaRestante = Math.max(0, quotaPorCombo - quotaBase);
+    if (quotaRestante > 0) {
+      const quotaAlternativas = alternativas.reduce(
+        (soma, o) => soma + (o.estoque.quantity || 0) * Math.max(1, o.consomeQtd || 1),
+        0
+      );
+      limiteGrupo = Math.min(limiteGrupo, Math.floor(quotaAlternativas / quotaRestante));
+    }
+
+    disponivel = Math.min(disponivel, limiteGrupo === Infinity ? 0 : limiteGrupo);
   }
   return disponivel === Infinity ? 0 : Math.max(0, disponivel);
 };
@@ -600,6 +616,7 @@ const comEstoqueDeCombo = (item) => {
 app.get("/api/estoque_prod", async (req, res) => {
   try {
     const produtos = await prisma.estoque.findMany({
+      orderBy: [{ name: 'asc' }, { id: 'asc' }],
       include: {
         product: true,
         category: { include: { parent: true } },
@@ -904,26 +921,14 @@ async function temUnidadeMaiorConvertivel(estoqueItem) {
   try {
     if (!estoqueItem?.productId) return false;
     const siblings = await prisma.estoque.findMany({
-      where: { productId: estoqueItem.productId, id: { not: estoqueItem.id }, quantity: { gt: 0 } }
+      where: { productId: estoqueItem.productId, id: { not: estoqueItem.id }, quantity: { gt: 0 } },
+      orderBy: { id: 'asc' }
     });
     if (siblings.length === 0) return false;
     const eqs = await prisma.unitEquivalence.findMany();
     const eqMap = {};
     eqs.forEach(e => { eqMap[e.unitName] = e; });
-    const currentEq = eqMap[estoqueItem.unit];
-    for (const sib of siblings) {
-      let ratio = null;
-      if (currentEq?.isFractional && currentEq?.fractionalValue > 0) {
-        ratio = currentEq.fractionalValue;
-      } else {
-        const sibEq = eqMap[sib.unit];
-        const currentVal = currentEq?.value || 1;
-        const sibVal = sibEq?.value || 1;
-        if (sibVal > currentVal) ratio = sibVal / currentVal;
-      }
-      if (ratio && ratio > 0 && sib.quantity >= 1) return true;
-    }
-    return false;
+    return irmaosConversiveis(estoqueItem, siblings, eqMap).some((c) => c.sibling.quantity >= 1);
   } catch {
     return false;
   }
@@ -1085,6 +1090,37 @@ async function buildEqMap(client) {
 // Retorna quantas "unidades base globais" uma unidade representa (não cadastradas = 1).
 function unitValue(eqMap, unit) {
   return eqMap[unit]?.value ?? 1;
+}
+
+// Lista as unidades irmãs aptas a abastecer `estoqueItem` por conversão automática,
+// ordenadas da melhor origem para a pior. Regras:
+// - nunca converter a partir de outra unidade fracional (Dose → Dose);
+// - quando o destino é fracional, só a unidade-pai de menor valor (ex.: Garrafa) é usada,
+//   evitando consumir embalagens maiores (Fardo) e perder saldo;
+// - a ordenação é determinística para que a baixa não varie entre vendas.
+function irmaosConversiveis(estoqueItem, siblings, eqMap) {
+  const currentEq = eqMap[estoqueItem.unit];
+  const candidatos = [];
+  for (const sib of siblings) {
+    const sibEq = eqMap[sib.unit];
+    if (sibEq?.isFractional) continue;
+    let ratio = null;
+    if (currentEq?.isFractional && currentEq?.fractionalValue > 0) {
+      ratio = currentEq.fractionalValue;
+    } else {
+      const currentVal = currentEq?.value || 1;
+      const sibVal = sibEq?.value || 1;
+      if (sibVal > currentVal) ratio = sibVal / currentVal;
+    }
+    if (!ratio || ratio <= 0) continue;
+    candidatos.push({ sibling: sib, ratio, peso: sibEq?.value ?? 1 });
+  }
+  candidatos.sort((a, b) => a.peso - b.peso || a.sibling.id - b.sibling.id);
+  if (currentEq?.isFractional && candidatos.length > 0) {
+    const menorPeso = candidatos[0].peso;
+    return candidatos.filter((c) => c.peso === menorPeso);
+  }
+  return candidatos;
 }
 
 // Resolve a unidade base (unitária = 1) de um produto.
@@ -2743,22 +2779,11 @@ async function baixarEstoqueComConversao(tx, estoqueId, needed, eqMap, saleId, d
   if (currentStock < needed) {
     const deficit = needed - currentStock;
     const siblings = await tx.estoque.findMany({
-      where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
+      where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } },
+      orderBy: { id: 'asc' }
     });
-    const currentEq = eqMap[estoqueItem.unit];
     let conversionDone = false;
-    for (const sibling of siblings) {
-      let ratio = null;
-      if (currentEq?.isFractional && currentEq?.fractionalValue > 0) {
-        // Unidade fracional (ex: Dose): 1 irmão-pai → fractionalValue doses
-        ratio = currentEq.fractionalValue;
-      } else {
-        const sibEq = eqMap[sibling.unit];
-        const currentVal = currentEq?.value || 1;
-        const sibVal = sibEq?.value || 1;
-        if (sibVal > currentVal) ratio = sibVal / currentVal;
-      }
-      if (!ratio || ratio <= 0) continue;
+    for (const { sibling, ratio } of irmaosConversiveis(estoqueItem, siblings, eqMap)) {
       const neededSiblings = Math.ceil(deficit / ratio);
       if (sibling.quantity < neededSiblings) continue;
 
@@ -2871,26 +2896,12 @@ app.post('/api/sales', async (req, res) => {
         // Verificar se há conversão automática possível a partir de unidade irmã
         const deficit = item.quantity - estoqueItem.quantity;
         const siblings = await prisma.estoque.findMany({
-          where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
+          where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } },
+          orderBy: { id: 'asc' }
         });
-        let canConvert = false;
-        const currentEqCheck = eqMapCheck[estoqueItem.unit];
-        for (const sib of siblings) {  
-          let ratio = null;
-          if (currentEqCheck?.isFractional && currentEqCheck?.fractionalValue > 0) {
-            // Unidade fracional (Dose): 1 irmão-pai → fractionalValue doses
-            ratio = currentEqCheck.fractionalValue;
-          } else {
-            // Unidade empacotada: comparar valores
-            const sibEq = eqMapCheck[sib.unit];
-            const currentVal = currentEqCheck?.value || 1;
-            const sibVal = sibEq?.value || 1;
-            if (sibVal > currentVal) ratio = sibVal / currentVal;
-          }
-          if (!ratio || ratio <= 0) continue;
-          const neededSiblings = Math.ceil(deficit / ratio);
-          if (sib.quantity >= neededSiblings) { canConvert = true; break; }
-        }
+        const canConvert = irmaosConversiveis(estoqueItem, siblings, eqMapCheck).some(
+          ({ sibling, ratio }) => sibling.quantity >= Math.ceil(deficit / ratio)
+        );
         if (!canConvert) {
           const lastMovement = await prisma.stockMovement.findFirst({
             where: { estoqueId: item.id, type: 'SALE' },
@@ -2998,24 +3009,12 @@ app.post('/api/sales', async (req, res) => {
 
           // Buscar itens do mesmo produto com unidade diferente
           const siblings = await tx.estoque.findMany({
-            where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } }
+            where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } },
+            orderBy: { id: 'asc' }
           });
 
-          const currentEq = eqMap[estoqueItem.unit];
           let conversionDone = false;
-          for (const sibling of siblings) {
-            let ratio = null;
-            if (currentEq?.isFractional && currentEq?.fractionalValue > 0) {
-              // Unidade fracional (ex: Dose): 1 irmão-pai → fractionalValue doses
-              ratio = currentEq.fractionalValue;
-            } else {
-              // Unidade empacotada: comparar valores na tabela
-              const sibEq = eqMap[sibling.unit];
-              const currentVal = currentEq?.value || 1;
-              const sibVal = sibEq?.value || 1;
-              if (sibVal > currentVal) ratio = sibVal / currentVal;
-            }
-            if (!ratio || ratio <= 0) continue; // sem ratio válido, pular irmão
+          for (const { sibling, ratio } of irmaosConversiveis(estoqueItem, siblings, eqMap)) {
             const neededSiblings = Math.ceil(deficit / ratio);
 
             if (sibling.quantity < neededSiblings) continue; // irmã também sem estoque suficiente
