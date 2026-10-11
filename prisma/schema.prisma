@@ -117,6 +117,8 @@ model Estoque {
   mostrarPdv       Boolean             @default(true) // false = não aparece na tela de venda do PDV
   isCombo          Boolean             @default(false) // true = não é unidade de medida real, e sim uma variação de venda (conjunto de produtos)
   comboNome        String? // rótulo exibido no PDV para a variação (ex.: "Combo", "Kit")
+  controlaMontante Boolean             @default(false) // true = saldo da garrafa e das doses é controlado por um montante único em ML
+  montanteMl       Float               @default(0) // montante em ML do produto (igual em todas as linhas controladas do mesmo produto)
   stockMovements   StockMovement[]
   saleItems        SaleItem[]
   composicoes      ComposicaoProduto[]

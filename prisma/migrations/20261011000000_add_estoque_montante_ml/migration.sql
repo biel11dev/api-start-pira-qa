@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "Estoque" ADD COLUMN     "controlaMontante" BOOLEAN NOT NULL DEFAULT false,
+ADD COLUMN     "montanteMl" DOUBLE PRECISION NOT NULL DEFAULT 0;

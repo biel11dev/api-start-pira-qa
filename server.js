@@ -620,7 +620,7 @@ app.get("/api/estoque_prod", async (req, res) => {
       include: {
         product: true,
         category: { include: { parent: true } },
-        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } },
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true, controlaMontante: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } },
         _count: { select: { composicaoOpcoes: true } }
       }
     });
@@ -637,7 +637,7 @@ app.get("/api/estoque_prod/:id", async (req, res) => {
       include: {
         product: true,
         category: { include: { parent: true } },
-        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true, controlaMontante: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
     res.json(product ? comEstoqueDeCombo(product) : { error: "Produto não encontrado" });
@@ -689,6 +689,51 @@ app.post("/api/estoque_prod/entrada", async (req, res) => {
 
     const result = await prisma.$transaction(async (tx) => {
       let estoqueItem;
+
+      // Produto controlado por montante: a entrada soma ML (garrafa = volume) e recalcula as unidades.
+      const irmaControlada = await tx.estoque.findFirst({
+        where: { productId: parseInt(productId), controlaMontante: true, isCombo: false }
+      });
+      if (irmaControlada) {
+        let linha = existingStock;
+        if (!linha) {
+          linha = await tx.estoque.create({
+            data: {
+              productId: parseInt(productId),
+              name: catalogProduct.name,
+              quantity: 0,
+              unit: unit,
+              value: entradaValue,
+              valuecusto: entradaCusto,
+              categoria_Id: catalogProduct.categoryId || null,
+              controlaMontante: true,
+              montanteMl: irmaControlada.montanteMl
+            }
+          });
+        } else if (!linha.controlaMontante) {
+          linha = await tx.estoque.update({
+            where: { id: linha.id },
+            data: { controlaMontante: true, montanteMl: irmaControlada.montanteMl }
+          });
+        }
+        const mov = await movimentarMontante(tx, linha, parsedQuantity);
+        await tx.estoque.update({ where: { id: linha.id }, data: { value: entradaValue, valuecusto: entradaCusto } });
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: linha.id,
+            type: 'ENTRY',
+            quantity: parsedQuantity,
+            previousStock: mov.previousStock,
+            newStock: mov.newStock,
+            description: `Entrada de ${parsedQuantity}x ${unit} - ${catalogProduct.name} (montante ${mov.montanteMl}ML)`,
+            referenceType: 'Manual'
+          }
+        });
+        return tx.estoque.findUnique({
+          where: { id: linha.id },
+          include: { product: true, category: { include: { parent: true } } }
+        });
+      }
 
       if (existingStock) {
         // Incrementar quantidade no registro existente
@@ -920,6 +965,7 @@ function getISOWeekString(date = new Date()) {
 async function temUnidadeMaiorConvertivel(estoqueItem) {
   try {
     if (!estoqueItem?.productId) return false;
+    if (estoqueItem.controlaMontante) return false; // montante já cobre todas as unidades
     const siblings = await prisma.estoque.findMany({
       where: { productId: estoqueItem.productId, id: { not: estoqueItem.id }, quantity: { gt: 0 } },
       orderBy: { id: 'asc' }
@@ -939,7 +985,7 @@ async function criarListaComprasSeNecessario(estoqueId, novaQuantidade) {
   try {
     const minimo = await prisma.estoqueMinimo.findUnique({ where: { estoqueId } });
     if (!minimo) return;
-    const estoque = await prisma.estoque.findUnique({ where: { id: estoqueId }, select: { id: true, name: true, productId: true, unit: true } });
+    const estoque = await prisma.estoque.findUnique({ where: { id: estoqueId }, select: { id: true, name: true, productId: true, unit: true, controlaMontante: true } });
     if (!estoque) return;
     if (novaQuantidade <= minimo.quantidadeMinima) {
       // Só é "falta" real se NÃO houver unidade de medida maior do mesmo produto para converter.
@@ -1142,6 +1188,166 @@ async function resolveProductBaseUnit(client, productId, eqMap, explicitBaseUnit
   return best || "Unidade";
 }
 
+// ===== Estoque por montante (ML) — opt-in por produto (Estoque.controlaMontante) =====
+// Para produtos vendidos inteiros e em doses (ex.: aguardente), o saldo real é um único
+// montante em ML. Garrafa e doses são derivadas dele (piso do montante / ML da unidade) e
+// gravadas em `quantity`, então o restante do sistema segue lendo `quantity` normalmente.
+// Produtos sem a flag não passam por nenhuma destas funções.
+
+function parseMl(texto) {
+  const m = /(\d+(?:[.,]\d+)?)\s*ml\b/i.exec(String(texto ?? ""));
+  return m ? parseFloat(m[1].replace(",", ".")) : null;
+}
+
+// ML que uma linha de estoque representa: unidade ("Dose 80ML") ou, na garrafa, o volume do título.
+function mlDaLinha(linha, nomeProduto) {
+  return parseMl(linha?.unit) ?? parseMl(linha?.name) ?? parseMl(nomeProduto);
+}
+
+function quantidadeDoMontante(montanteMl, ml) {
+  return Math.floor(montanteMl / ml + 1e-9);
+}
+
+// Linhas do produto elegíveis ao controle (variações de venda/combos ficam de fora).
+function linhasDoProduto(client, productId, apenasControladas) {
+  return client.estoque.findMany({
+    where: { productId, isCombo: false, ...(apenasControladas ? { controlaMontante: true } : {}) },
+    include: { product: { select: { name: true } } },
+    orderBy: { id: "asc" },
+  });
+}
+
+// Grava o montante e recalcula `quantity` de todas as linhas controladas do produto.
+async function sincronizarMontante(tx, productId, montanteMl) {
+  const linhas = await linhasDoProduto(tx, productId, true);
+  for (const l of linhas) {
+    const ml = mlDaLinha(l, l.product?.name);
+    if (!ml) continue;
+    await tx.estoque.update({
+      where: { id: l.id },
+      data: { montanteMl, quantity: quantidadeDoMontante(montanteMl, ml) },
+    });
+  }
+}
+
+// Aplica uma variação em unidades da linha ao montante (positivo = entrada, negativo = baixa).
+async function movimentarMontante(tx, estoqueItem, deltaUnidades, rotuloErro) {
+  const linhas = await linhasDoProduto(tx, estoqueItem.productId, true);
+  const linha = linhas.find((l) => l.id === estoqueItem.id);
+  const ml = linha ? mlDaLinha(linha, linha.product?.name) : null;
+  if (!ml) {
+    throw new Error(`Não foi possível identificar o volume (ML) de "${estoqueItem.name}" (${estoqueItem.unit}).`);
+  }
+  const deltaMl = deltaUnidades * ml;
+  const alvo = { productId: estoqueItem.productId, controlaMontante: true, isCombo: false };
+
+  if (deltaMl < 0) {
+    const r = await tx.estoque.updateMany({
+      where: { ...alvo, montanteMl: { gte: -deltaMl - 1e-6 } },
+      data: { montanteMl: { increment: deltaMl } },
+    });
+    if (r.count === 0) {
+      throw new Error(`Estoque insuficiente para ${rotuloErro || `"${estoqueItem.name}"`} (${estoqueItem.unit}). Disponível: ${linha.quantity}, Necessário: ${-deltaUnidades}.`);
+    }
+  } else if (deltaMl > 0) {
+    await tx.estoque.updateMany({ where: alvo, data: { montanteMl: { increment: deltaMl } } });
+  }
+
+  const atual = await tx.estoque.findUnique({ where: { id: estoqueItem.id }, select: { montanteMl: true } });
+  await sincronizarMontante(tx, estoqueItem.productId, atual.montanteMl);
+  const depois = await tx.estoque.findUnique({ where: { id: estoqueItem.id }, select: { quantity: true } });
+  return { previousStock: linha.quantity, newStock: depois.quantity, montanteMl: atual.montanteMl };
+}
+
+// Montante atual somando o que já existe em cada linha (garrafas x volume + doses x ML).
+function calcularMontanteInicial(linhas) {
+  let total = 0;
+  const detalhes = linhas.map((l) => {
+    const ml = mlDaLinha(l, l.product?.name);
+    const subtotalMl = ml ? (l.quantity || 0) * ml : null;
+    if (subtotalMl != null) total += subtotalMl;
+    return { id: l.id, unit: l.unit, name: l.name, quantity: l.quantity, ml, subtotalMl, ativo: l.controlaMontante };
+  });
+  return { total, detalhes };
+}
+
+// Prévia: como ficam as quantidades se o controle por montante for ativado agora.
+app.get("/api/estoque_prod/montante/preview/:productId", async (req, res) => {
+  try {
+    const productId = parseInt(req.params.productId, 10);
+    if (isNaN(productId)) return res.status(400).json({ error: "productId inválido" });
+    const linhas = await linhasDoProduto(prisma, productId, false);
+    if (linhas.length === 0) return res.status(404).json({ error: "Produto sem itens no estoque." });
+    const ativo = linhas.some((l) => l.controlaMontante);
+    const controladas = linhas.filter((l) => l.controlaMontante);
+    const base = ativo ? controladas : linhas;
+    const { total, detalhes } = calcularMontanteInicial(base);
+    const montanteMl = ativo ? Math.max(...controladas.map((l) => l.montanteMl || 0)) : total;
+    const semMl = detalhes.filter((d) => !d.ml);
+    const resultado = detalhes
+      .filter((d) => d.ml)
+      .map((d) => ({ id: d.id, unit: d.unit, ml: d.ml, quantidadeAtual: d.quantity, quantidadeNova: quantidadeDoMontante(montanteMl, d.ml) }));
+    res.json({ productId, nome: linhas[0].product?.name || linhas[0].name, ativo, montanteMl, detalhes, resultado, semMl });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao gerar prévia do montante", details: error.message });
+  }
+});
+
+// Ativa o controle por montante: converte o saldo atual em ML e recalcula as quantidades.
+app.post("/api/estoque_prod/montante/ativar", async (req, res) => {
+  try {
+    const productId = parseInt(req.body.productId, 10);
+    if (isNaN(productId)) return res.status(400).json({ error: "productId inválido" });
+    const result = await prisma.$transaction(async (tx) => {
+      const linhas = await linhasDoProduto(tx, productId, false);
+      if (linhas.length === 0) throw new Error("Produto sem itens no estoque.");
+      if (linhas.some((l) => l.controlaMontante)) throw new Error("Este produto já usa controle por montante.");
+      const { total, detalhes } = calcularMontanteInicial(linhas);
+      const semMl = detalhes.filter((d) => !d.ml);
+      if (semMl.length > 0) {
+        throw new Error(`Não foi possível identificar o ML de: ${semMl.map((d) => d.unit).join(", ")}. Inclua o volume (ex.: 80ML) na unidade ou no nome.`);
+      }
+      const antes = new Map(linhas.map((l) => [l.id, l.quantity]));
+      await tx.estoque.updateMany({ where: { productId, isCombo: false }, data: { controlaMontante: true, montanteMl: total } });
+      await sincronizarMontante(tx, productId, total);
+      const depois = await linhasDoProduto(tx, productId, true);
+      for (const l of depois) {
+        if (l.quantity === antes.get(l.id)) continue;
+        await tx.stockMovement.create({
+          data: {
+            estoqueId: l.id,
+            type: "ADJUSTMENT",
+            quantity: l.quantity - antes.get(l.id),
+            previousStock: antes.get(l.id),
+            newStock: l.quantity,
+            description: `Controle por montante ativado (${total}ML)`,
+            referenceType: "Manual",
+          },
+        });
+      }
+      return { montanteMl: total, linhas: depois.map((l) => ({ id: l.id, unit: l.unit, quantity: l.quantity })) };
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Desativa: mantém as quantidades já calculadas e volta à lógica padrão de conversão.
+app.post("/api/estoque_prod/montante/desativar", async (req, res) => {
+  try {
+    const productId = parseInt(req.body.productId, 10);
+    if (isNaN(productId)) return res.status(400).json({ error: "productId inválido" });
+    await prisma.estoque.updateMany({ where: { productId, controlaMontante: true }, data: { controlaMontante: false, montanteMl: 0 } });
+    res.json({ message: "Controle por montante desativado." });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao desativar controle por montante", details: error.message });
+  }
+});
+
+// Conversões manuais não se aplicam a itens controlados por montante.
+const MSG_MONTANTE_SEM_CONVERSAO = "Este produto é controlado por montante (ML): não há conversão entre unidades.";
+
 // Conversão de unidades - ex: 1 Fardo (12un) → 12 Unidades
 app.post("/api/estoque_prod/converter", async (req, res) => {
   try {
@@ -1163,6 +1369,9 @@ app.post("/api/estoque_prod/converter", async (req, res) => {
     });
     if (!estoqueItem) {
       return res.status(404).json({ error: "Item não encontrado no estoque." });
+    }
+    if (estoqueItem.controlaMontante) {
+      return res.status(400).json({ error: MSG_MONTANTE_SEM_CONVERSAO });
     }
 
     // Determinar a unidade base (unitária) do produto
@@ -1302,6 +1511,9 @@ app.post("/api/estoque_prod/converter-reverso", async (req, res) => {
     if (!estoqueItem) {
       return res.status(404).json({ error: "Item não encontrado no estoque." });
     }
+    if (estoqueItem.controlaMontante) {
+      return res.status(400).json({ error: MSG_MONTANTE_SEM_CONVERSAO });
+    }
 
     // Determinar a unidade base (unitária) do produto
     const eqMap = await buildEqMap(prisma);
@@ -1438,6 +1650,9 @@ app.post("/api/estoque_prod/converter-dose", async (req, res) => {
       include: { product: true }
     });
     if (!estoqueItem) return res.status(404).json({ error: "Item não encontrado no estoque." });
+    if (estoqueItem.controlaMontante) {
+      return res.status(400).json({ error: MSG_MONTANTE_SEM_CONVERSAO });
+    }
     if (estoqueItem.quantity < parsedQty) {
       return res.status(400).json({ error: `Quantidade insuficiente. Disponível: ${estoqueItem.quantity} ${estoqueItem.unit}(s)` });
     }
@@ -1586,11 +1801,26 @@ app.put("/api/estoque_prod/:id", async (req, res) => {
       return res.status(400).json({ error: "Custo deve ser um número válido." });
     }
 
+    // Item controlado por montante: a quantidade informada vira o novo montante (a sobra em ML é preservada).
+    let quantidadeFinal = parsedQuantity;
+    const itemAtual = await prisma.estoque.findUnique({ where: { id: parseInt(req.params.id) } });
+    if (itemAtual?.controlaMontante && parsedQuantity !== itemAtual.quantity) {
+      quantidadeFinal = await prisma.$transaction(async (tx) => {
+        const linhas = await linhasDoProduto(tx, itemAtual.productId, true);
+        const linha = linhas.find((l) => l.id === itemAtual.id);
+        const ml = linha ? mlDaLinha(linha, linha.product?.name) : null;
+        if (!ml) throw new Error(`Não foi possível identificar o volume (ML) de "${itemAtual.name}" (${itemAtual.unit}).`);
+        const sobra = (itemAtual.montanteMl || 0) - quantidadeDoMontante(itemAtual.montanteMl || 0, ml) * ml;
+        await sincronizarMontante(tx, itemAtual.productId, parsedQuantity * ml + sobra);
+        return parsedQuantity;
+      });
+    }
+
     const updatedProduct = await prisma.estoque.update({
       where: { id: parseInt(req.params.id) },
       data: { 
         name, 
-        quantity: parsedQuantity, 
+        quantity: quantidadeFinal, 
         unit, 
         value: parsedValue, 
         valuecusto: parsedValueCusto,
@@ -2776,6 +3006,24 @@ async function baixarEstoqueComConversao(tx, estoqueId, needed, eqMap, saleId, d
   // Descartáveis (contabiliza=false) não baixam estoque
   if (estoqueItem.contabiliza === false) return;
 
+  // Produto por montante: baixa em ML, sem conversão entre unidades
+  if (estoqueItem.controlaMontante) {
+    const mov = await movimentarMontante(tx, estoqueItem, -needed, rotuloErro);
+    await tx.stockMovement.create({
+      data: {
+        estoqueId: estoqueItem.id,
+        type: 'SALE',
+        quantity: -needed,
+        previousStock: mov.previousStock,
+        newStock: mov.newStock,
+        description: descricao,
+        referenceId: saleId,
+        referenceType: 'Sale'
+      }
+    });
+    return;
+  }
+
   let currentStock = estoqueItem.quantity;
 
   if (currentStock < needed) {
@@ -2901,7 +3149,7 @@ app.post('/api/sales', async (req, res) => {
           where: { productId: estoqueItem.productId, id: { not: estoqueItem.id } },
           orderBy: { id: 'asc' }
         });
-        const canConvert = irmaosConversiveis(estoqueItem, siblings, eqMapCheck).some(
+        const canConvert = !estoqueItem.controlaMontante && irmaosConversiveis(estoqueItem, siblings, eqMapCheck).some(
           ({ sibling, ratio }) => sibling.quantity >= Math.ceil(deficit / ratio)
         );
         if (!canConvert) {
@@ -3004,6 +3252,24 @@ app.post('/api/sales', async (req, res) => {
 
         // Combos não baixam estoque próprio — só os componentes selecionados.
         if (estoqueItem.isCombo) continue;
+
+        // Produto por montante: baixa em ML direto, sem conversão entre unidades.
+        if (estoqueItem.controlaMontante) {
+          const mov = await movimentarMontante(tx, estoqueItem, -item.quantity, `"${item.name}"`);
+          await tx.stockMovement.create({
+            data: {
+              estoqueId: item.id,
+              type: 'SALE',
+              quantity: -item.quantity,
+              previousStock: mov.previousStock,
+              newStock: mov.newStock,
+              description: `Venda #${sale.id} - ${item.name} (${item.quantity}x)`,
+              referenceId: sale.id,
+              referenceType: 'Sale'
+            }
+          });
+          continue;
+        }
 
         // Se estoque insuficiente, tentar conversão automática de unidade irmã
         if (currentStock < item.quantity) {
@@ -3528,17 +3794,21 @@ app.post('/api/stock-movements', async (req, res) => {
 
       const previousStock = estoqueItem.quantity;
       const parsedQty = parseFloat(quantity);
-      const newStock = previousStock + parsedQty; // positivo = entrada, negativo = saída
+      let newStock = previousStock + parsedQty; // positivo = entrada, negativo = saída
 
       if (newStock < 0) {
         throw new Error(`Estoque não pode ficar negativo. Estoque atual: ${previousStock}`);
       }
 
-      // Atualizar quantidade no estoque
-      await tx.estoque.update({
-        where: { id: parseInt(estoqueId) },
-        data: { quantity: newStock }
-      });
+      // Atualizar quantidade no estoque (itens por montante recalculam todas as unidades)
+      if (estoqueItem.controlaMontante) {
+        newStock = (await movimentarMontante(tx, estoqueItem, parsedQty)).newStock;
+      } else {
+        await tx.estoque.update({
+          where: { id: parseInt(estoqueId) },
+          data: { quantity: newStock }
+        });
+      }
 
       // Registrar movimentação
       const movement = await tx.stockMovement.create({
@@ -3866,7 +4136,7 @@ app.patch('/api/estoque_prod/:id/combo', async (req, res) => {
       where: { id: parseInt(req.params.id) },
       data,
       include: {
-        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
+        composicoes: { include: { opcoes: { include: { estoque: { select: { id: true, name: true, quantity: true, productId: true, unit: true, controlaMontante: true } } }, orderBy: { id: 'asc' } } }, orderBy: { ordem: 'asc' } }
       }
     });
     res.json(comEstoqueDeCombo(item));
@@ -5600,8 +5870,12 @@ app.post("/api/pdv-comandas/:id/items", async (req, res) => {
           const estoqueItem = await tx.estoque.findUnique({ where: { id: item.id } });
           if (estoqueItem && estoqueItem.quantity >= item.quantity) {
             const prev = estoqueItem.quantity;
-            const novo = prev - item.quantity;
-            await tx.estoque.update({ where: { id: item.id }, data: { quantity: novo } });
+            let novo = prev - item.quantity;
+            if (estoqueItem.controlaMontante) {
+              novo = (await movimentarMontante(tx, estoqueItem, -item.quantity)).newStock;
+            } else {
+              await tx.estoque.update({ where: { id: item.id }, data: { quantity: novo } });
+            }
             await tx.stockMovement.create({
               data: {
                 estoqueId: item.id, type: 'SALE', quantity: -item.quantity,
