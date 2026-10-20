@@ -159,6 +159,8 @@ model User {
   pessoal      Boolean?
   auditoria    Boolean?
   funcionario  Boolean? @default(false)
+  loginAt      DateTime? // Primeiro login do dia
+  logoutAt     DateTime? // Último logout confirmado do dia
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 }
@@ -175,6 +177,7 @@ model Employee {
   contato     String? // Contato do funcionário
   dataEntrada DateTime? // Data de entrada do funcionário
   ativo       Boolean               @default(true) // Status do funcionário
+  autoPonto   Boolean               @default(false) // Registra entrada/saída no Ponto a partir do login/logout
   createdAt   DateTime              @default(now()) // Data de criação do registro
   points      DailyPoint[] // Relacionamento com os pontos diários
   metaHistory EmployeeMetaHistory[] // Histórico de metas

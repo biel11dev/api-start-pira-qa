@@ -69,7 +69,7 @@ const rotaParaModulo = (rota) => {
   if (rota.includes("/api/employees") || rota.includes("/api/daily-points") || rota.includes("/api/weekly-meta")) return "ponto";
   if (rota.includes("/api/users")) return "acessos";
   if (rota.includes("/api/register")) return "acessos";
-  if (rota.includes("/api/login")) return "autenticacao";
+  if (rota.includes("/api/login") || rota.includes("/api/logout")) return "autenticacao";
   return "outro";
 };
 
@@ -264,12 +264,103 @@ app.get("/api/users", async (req, res) => {
   }
 });
 
+// ===== Ponto automático (login/logout) =====
+// O Ponto guarda o horário local como se fosse UTC ("YYYY-MM-DDTHH:mm:00.000Z"), então usamos o fuso de Brasilía.
+const PONTO_TZ = "America/Sao_Paulo";
+
+const dataHoraLocal = (instante) => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: PONTO_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  })
+    .formatToParts(instante)
+    .reduce((acc, p) => ({ ...acc, [p.type]: p.value }), {});
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
+};
+
+// Funcionário ativo com ponto automático habilitado, relacionado ao usuário pelo nome (case-insensitive).
+const buscarEmployeeAutoPonto = async (user) => {
+  const nomes = [user.name, user.username].filter(Boolean).map((n) => n.trim().toLowerCase());
+  if (nomes.length === 0) return null;
+  const employees = await prisma.employee.findMany({ where: { autoPonto: true, ativo: true } });
+  return employees.find((e) => nomes.includes((e.name || "").trim().toLowerCase())) || null;
+};
+
+const pontoDoDia = (employeeId, date) =>
+  prisma.dailyPoint.findFirst({
+    where: {
+      employeeId,
+      date: {
+        gte: new Date(`${date}T00:00:00.000Z`),
+        lt: new Date(`${date}T23:59:59.999Z`),
+      },
+    },
+  });
+
+// Grava entrada (login) e/ou saída (logout) no Ponto do dia, sem sobrescrever entrada já existente nem dias com falta.
+const registrarPontoAutomatico = async (employee, { entrada, saida }) => {
+  const hoje = dataHoraLocal(new Date()).date;
+  const paraDateTime = (instante) => new Date(`${hoje}T${dataHoraLocal(instante).time}:00.000Z`);
+  const existente = await pontoDoDia(employee.id, hoje);
+
+  if (!existente) {
+    await prisma.dailyPoint.create({
+      data: {
+        date: new Date(hoje),
+        entry: entrada ? paraDateTime(entrada) : null,
+        exit: saida ? paraDateTime(saida) : null,
+        employeeId: employee.id,
+      },
+    });
+    return;
+  }
+  if (existente.falta) return;
+
+  const data = {};
+  if (entrada && !existente.entry) data.entry = paraDateTime(entrada);
+  if (saida) data.exit = paraDateTime(saida);
+  if (Object.keys(data).length > 0) {
+    await prisma.dailyPoint.update({ where: { id: existente.id }, data });
+  }
+};
+
+const usuarioEhAdmin = async (req) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return false;
+    const decoded = jwt.verify(token, SECRET_KEY);
+    const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
+    return user?.acessos === true;
+  } catch {
+    return false;
+  }
+};
+
 app.post("/api/login", async (req, res) => {
   const { username, password } = req.body;
   const user = await prisma.user.findUnique({ where: { username } });
 
   if (!user || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ error: "Usuário ou senha inválidos" });
+  }
+
+  // Registra o primeiro login do dia; falhas aqui nunca impedem o login.
+  try {
+    const agora = new Date();
+    const mesmoDia = user.loginAt && dataHoraLocal(user.loginAt).date === dataHoraLocal(agora).date;
+    const loginDoDia = mesmoDia ? user.loginAt : agora;
+    if (!mesmoDia) {
+      await prisma.user.update({ where: { id: user.id }, data: { loginAt: agora, logoutAt: null } });
+    }
+    const employee = await buscarEmployeeAutoPonto(user);
+    if (employee) await registrarPontoAutomatico(employee, { entrada: loginDoDia });
+  } catch (err) {
+    console.error("Erro ao registrar login/ponto automático:", err.message);
   }
 
   const token = jwt.sign({ userId: user.id }, SECRET_KEY, { expiresIn: "12h" });
@@ -293,6 +384,38 @@ app.post("/api/login", async (req, res) => {
       auditoria: user.auditoria,
     },
   });
+});
+
+// Informa se o logout do usuário precisa de confirmação (ponto automático) e o horário de saída atual.
+app.get("/api/ponto-auto/status", authenticate, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.userId } });
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
+    const employee = await buscarEmployeeAutoPonto(user);
+    res.json({ autoPonto: !!employee, exitTime: dataHoraLocal(new Date()).time });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao consultar ponto automático", details: error.message });
+  }
+});
+
+// Registra o logout do dia; com ponto automático habilitado também grava a saída no Ponto.
+app.post("/api/logout", authenticate, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.userId } });
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
+
+    const agora = new Date();
+    await prisma.user.update({ where: { id: user.id }, data: { logoutAt: agora } });
+
+    const employee = await buscarEmployeeAutoPonto(user);
+    if (employee) {
+      const loginHoje = user.loginAt && dataHoraLocal(user.loginAt).date === dataHoraLocal(agora).date ? user.loginAt : null;
+      await registrarPontoAutomatico(employee, { entrada: loginHoje, saida: agora });
+    }
+    res.json({ ok: true, autoPonto: !!employee, exitTime: dataHoraLocal(agora).time });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao registrar logout", details: error.message });
+  }
 });
 
 app.put("/api/users/:id", async (req, res) => {
@@ -2270,7 +2393,8 @@ app.post("/api/employees", async (req, res) => {
       metasExtras = null,
       contato = null,
       dataEntrada = null,
-      ativo = true
+      ativo = true,
+      autoPonto = false
     } = req.body;
     
     const newEmployee = await prisma.employee.create({
@@ -2284,7 +2408,8 @@ app.post("/api/employees", async (req, res) => {
         metasExtras: metasExtras ? JSON.stringify(metasExtras) : null,
         contato,
         dataEntrada: dataEntrada ? new Date(dataEntrada) : null,
-        ativo
+        ativo,
+        autoPonto: autoPonto === true && (await usuarioEhAdmin(req))
       },
     });
     res.status(201).json(newEmployee);
@@ -2305,7 +2430,8 @@ app.put("/api/employees/:id", async (req, res) => {
       metasExtras,
       contato,
       dataEntrada,
-      ativo
+      ativo,
+      autoPonto
     } = req.body;
     
     // Construir objeto de atualização dinamicamente
@@ -2320,6 +2446,8 @@ app.put("/api/employees/:id", async (req, res) => {
     if (contato !== undefined) updateData.contato = contato;
     if (dataEntrada !== undefined) updateData.dataEntrada = dataEntrada ? new Date(dataEntrada) : null;
     if (ativo !== undefined) updateData.ativo = ativo;
+    // Somente administrador altera o ponto automático; para os demais o campo é ignorado.
+    if (autoPonto !== undefined && (await usuarioEhAdmin(req))) updateData.autoPonto = autoPonto === true;
     
     const updatedEmployee = await prisma.employee.update({
       where: { id: parseInt(req.params.id) },
